@@ -2,7 +2,7 @@
 import os
 import pandas as pd
 import argparse
-import help_functions
+#import help_functions
 
 parser = argparse.ArgumentParser(description="Run protein design pipeline")
 parser.add_argument("--output_dir", help="Path to output directory")
