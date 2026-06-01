@@ -572,8 +572,6 @@ def recalculate_a3m(input_a3m_path: str, new_query_seq: str, output_a3m_path: st
     # Extract the old query and ensure standard A3M format (no insertions or gaps)
     old_query_seq = "".join([c for c in seqs[0] if c.isupper()])
     new_query_clean = new_query_seq.replace('-', '').upper()
-    print(f"DEBUG: new_query_clean: {new_query_clean}")
-    print(f"DEBUG: old_query_seq: {old_query_seq}")
     # 2. Compute global pairwise alignment between old and new queries
     aligner = Align.PairwiseAligner()
     aligner.mode = 'global'
