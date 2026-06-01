@@ -530,101 +530,201 @@ def calculate_RMSD_linker_len(
         linker_length,
     )
 
+def sanitize_string(text):
+    """Removes null bytes and non-printable control characters."""
+    text = text.replace('\x00', '')
+    return "".join(c for c in text if c in string.printable)
+
+def align_and_pad_a3m(mpnn_seq, a3m_seqs):
+    """
+    Aligns a target sequence against an A3M query sequence using dynamic programming.
+    Computes positional insertions and deletions to project A3M MSA blocks onto the new sequence topology.
+    """
+    a3m_key_seq = a3m_seqs[0]
+
+    # Extract query match states (A3M queries strictly define match columns)
+    old_query = "".join([c for c in a3m_key_seq if c.isupper() or c == '-'])
+
+    if not old_query or not mpnn_seq:
+        return None
+
+    # Initialize alignment with free end gaps to support sub-stringing and extensions
+    aligner = PairwiseAligner()
+    aligner.mode = 'global'
+    aligner.match_score = 2
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -2
+    aligner.extend_gap_score = -0.5
+    aligner.target_end_gap_score = 0.0
+    aligner.query_end_gap_score = 0.0
+
+    alignments = aligner.align(mpnn_seq, old_query)
+    if not alignments:
+        return None
+
+    best_alignment = alignments[0]
+
+    # Reconstruct exact alignment strings from block mapping coordinates
+    target_aligned = ""
+    query_aligned = ""
+    t_idx = 0
+    q_idx = 0
+
+    for (t_start, t_end), (q_start, q_end) in zip(best_alignment.aligned[0], best_alignment.aligned[1]):
+        if t_start > t_idx:
+            target_aligned += mpnn_seq[t_idx:t_start]
+            query_aligned += "-" * (t_start - t_idx)
+        if q_start > q_idx:
+            query_aligned += old_query[q_idx:q_start]
+            target_aligned += "-" * (q_start - q_idx)
+
+        target_aligned += mpnn_seq[t_start:t_end]
+        query_aligned += old_query[q_start:q_end]
+        t_idx = t_end
+        q_idx = q_end
+
+    if t_idx < len(mpnn_seq):
+        target_aligned += mpnn_seq[t_idx:]
+        query_aligned += "-" * (len(mpnn_seq) - t_idx)
+    if q_idx < len(old_query):
+        query_aligned += old_query[q_idx:]
+        target_aligned += "-" * (len(old_query) - q_idx)
+
+    def get_a3m_blocks(seq):
+        """Tokenize an A3M sequence into match-state blocks with attached unaligned insertions."""
+        blocks = []
+        current_block = ""
+        for char in seq:
+            if char.isupper() or char == '-':
+                if current_block:
+                    blocks.append(current_block)
+                current_block = char
+            else:
+                current_block += char
+        if current_block:
+            blocks.append(current_block)
+
+        if blocks and blocks[0] and blocks[0][0].islower():
+            leading = blocks[0]
+            blocks = blocks[1:]
+        else:
+            leading = ""
+        return leading, blocks
+
+    # Validate coordinate parity
+    _, query_blocks = get_a3m_blocks(a3m_key_seq)
+    if len(query_blocks) != len(old_query):
+        return None
+
+    new_seqs = []
+    for idx in range(1, len(a3m_seqs)):
+        seq = a3m_seqs[idx]
+        leading, blocks = get_a3m_blocks(seq)
+
+        if len(blocks) != len(old_query):
+            return None
+
+        new_seq_parts = [leading]
+        block_idx = 0
+
+        # Traverse alignment coordinate matrix
+        for t_char, q_char in zip(target_aligned, query_aligned):
+            if t_char != '-' and q_char != '-':
+                # Match/Mismatch
+                new_seq_parts.append(blocks[block_idx])
+                block_idx += 1
+            elif t_char != '-' and q_char == '-':
+                # Insertion mapped to MPNN topology -> apply deletion gap to MSA
+                new_seq_parts.append('-')
+            elif t_char == '-' and q_char != '-':
+                # Deletion mapped to MPNN topology -> terminate obsolete MSA block
+                block_idx += 1
+
+        new_seqs.append("".join(new_seq_parts))
+
+    return new_seqs
+
 
 def make_alignment_file_boltz(sequence_id, sequence, alignment_dir, output_dir):
+    """
+    Creates A3M alignment files mapping sequence inputs against MSA targets,
+    accounting for insertions, deletions, and linkers.
+    """
+    os.makedirs(output_dir, exist_ok=True)
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    name = sequence_id
-    seq = sequence
-    chain_ids = []
-    sequences = []
-    # Split multi-chain sequences by colon
-    split_chains = seq.split(":")
-    for i, chain_seq in enumerate(split_chains):
-        chain_id = f"{letters[i]}"
-        chain_ids.append(chain_id)
-        sequences.append(chain_seq)
 
-    chain_lengths = [len(s) for s in sequences]
-    # Get all relevant files
-    alignment_files = [f for f in os.listdir(alignment_dir) if f.endswith(".a3m")]
+    sequence = sanitize_string(sequence)
+    split_chains = sequence.split(":")
 
-    # Sort by the chain letter
-    alignment_files_sorted = sorted(alignment_files, key=extract_chain_letter)
+    alignment_files = []
+    if os.path.exists(alignment_dir):
+        alignment_files = [f for f in os.listdir(alignment_dir) if f.endswith(".a3m")]
 
-    for idxsequence, sequence in enumerate(sequences):
-        sequence = sequence.strip()
-        chain_id = chain_ids[idxsequence]
-        print(f"Processing chain {chain_id} for {name} with sequence {sequence}...")
+    for i, mpnn_chain_seq in enumerate(split_chains):
+        mpnn_chain_seq = "".join(c for c in mpnn_chain_seq if c.isalpha())
+        chain_id = letters[i]
 
-        with open(f"{output_dir}/{name}_{chain_id}.a3m", "w+") as f:
-            f.write(f">101\n")
-            f.write(sequence + "\n")
+        print(f"Processing chain {chain_id} for {sequence_id} with sequence {mpnn_chain_seq}...")
 
-            # Iterate in sorted order
-            filename = None
-            for fn in alignment_files_sorted:
-                if f"Chain_{chain_id}" in fn:
-                    filename = fn
-                    break
-            if filename is None:
-                print(f"Could not find alignment file for chain {chain_id}")
-                f.write(f">101\n")
-                f.write(sequence + "\n")
-            else:
-                path = os.path.join(alignment_dir, filename)
-                with open(path) as afile:
+        matching_file = next(
+            (f for f in alignment_files if f"Chain_{chain_id}" in f or f"auth_{chain_id}" in f),
+            None
+        )
 
-                    next(afile)
-                    # read original sequence
-                    reference_name = afile.readline()
-                    reference_seq = afile.readline()
-                    reference_seq = "".join(
-                        [c for c in reference_seq if not c.islower()]
-                    )
-                    # Compute positions to keep
-                    positions_to_keep = masked_positions(sequence, reference_seq)
+        output_path = os.path.join(output_dir, f"{sequence_id}_{chain_id}.a3m")
 
-                    while True:
-                        name_line = afile.readline()
-                        seq_line = afile.readline()
-                        seq_line = "".join([c for c in seq_line if not c.islower()])
-                        if not seq_line:
-                            break
+        if not matching_file:
+            print(f"Warning: No alignment file found for chain {chain_id}. Writing base FASTA only.")
+            with open(output_path, "w") as f:
+                f.write(f">{sequence_id}_{chain_id}\n{mpnn_chain_seq}\n")
+            continue
 
-                        name_line = name_line.rstrip()
-                        seq_line = seq_line.rstrip()
+        a3m_path = os.path.join(alignment_dir, matching_file)
 
-                        masked_seq = ["-"] * (len(sequence))  # NEEDS A -1
-                        # Place masked residues at the correct positions in full_sequence
-                        for j, pos in enumerate(positions_to_keep):
-                            if j < len(seq_line):
-                                masked_seq[pos] = seq_line[j]
-                        f.write(name_line + "\n")
-                        f.write("".join(masked_seq) + "\n")
-
-        with open(f"{output_dir}/{name}_{chain_id}.a3m", "rb+") as f:
-            f.seek(-1, 2)  # move to the last byte
-            if f.read(1) == b"\n":
-                f.seek(-1, 2)
-                f.truncate()
-
-        cleaned_lines = []
-
-        # Read and clean
-        with open(f"{output_dir}/{name}_{chain_id}.a3m", "r") as f:
+        headers = []
+        seqs = []
+        with open(a3m_path, "r") as f:
+            header = None
+            current_seq = []
             for line in f:
-                line = line.strip()
-                if not line:
+                line = sanitize_string(line.strip())
+                if not line or line.startswith('#'):
                     continue
-                if line.startswith("#") or line.startswith(">"):
-                    cleaned_lines.append(line)
-                    continue
-                cleaned_seq = "".join([c.upper() if c.isalpha() else "-" for c in line])
-                cleaned_lines.append(cleaned_seq)
+                if line.startswith('>'):
+                    if header is not None:
+                        headers.append(header)
+                        seqs.append("".join(current_seq))
+                    header = line
+                    current_seq = []
+                else:
+                    current_seq.append(line)
 
-        # Overwrite the same file
-        with open(f"{output_dir}/{name}_{chain_id}.a3m", "w") as f:
-            f.write("\n".join(cleaned_lines))
+            if header is not None:
+                headers.append(header)
+                seqs.append("".join(current_seq))
+
+        if not seqs:
+            print(f"Warning: Alignment file {matching_file} is empty. Writing base FASTA only.")
+            with open(output_path, "w") as f:
+                f.write(f">{sequence_id}_{chain_id}\n{mpnn_chain_seq}\n")
+            continue
+
+        # Execute mapping and gap projection computation
+        aligned_msa = align_and_pad_a3m(mpnn_chain_seq, seqs)
+
+        with open(output_path, "w") as f:
+            f.write(f">{sequence_id}_{chain_id}\n")
+            f.write(f"{mpnn_chain_seq}\n")
+
+            if aligned_msa is not None:
+                for h, s in zip(headers[1:], aligned_msa):
+                    f.write(f"{h}\n{s}\n")
+            else:
+                # System fallback for discontinuous or structurally unparseable A3M matrices
+                print(f"Warning: Failed to map sequence topology for chain {chain_id}. "
+                      f"Applying direct substitution; resultant MSA continuity may fracture.")
+                for j in range(1, len(seqs)):
+                    f.write(f"{headers[j]}\n{seqs[j]}\n")
 
 
 def make_alignment_file(cfg, trb_path, pdb_file, mpnn_seq, alignments_path, output):
