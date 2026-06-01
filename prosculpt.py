@@ -1,7 +1,7 @@
 import pickle
 from Bio.PDB import PDBParser, PDBIO, Superimposer, PPBuilder, MMCIFParser
 from Bio.SVDSuperimposer import SVDSuperimposer
-from Bio import SeqIO
+from Bio import SeqIO, Align
 from Bio.Seq import Seq
 import json
 import glob
@@ -535,114 +535,120 @@ def sanitize_string(text):
     text = text.replace('\x00', '')
     return "".join(c for c in text if c in string.printable)
 
-def align_and_pad_a3m(mpnn_seq, a3m_seqs):
+
+def recalculate_a3m(input_a3m_path: str, new_query_seq: str, output_a3m_path: str) -> None:
     """
-    Aligns a target sequence against an A3M query sequence using dynamic programming.
-    Computes positional insertions and deletions to project A3M MSA blocks onto the new sequence topology.
+    Recalculates an A3M MSA matrix against a new query sequence.
+
+    Args:
+        input_a3m_path: Path to the source A3M file.
+        new_query_seq: The new unaligned query sequence string.
+        output_a3m_path: Path to write the transformed A3M file.
     """
-    a3m_key_seq = a3m_seqs[0]
-
-    # Extract query match states (A3M queries strictly define match columns)
-    old_query = "".join([c for c in a3m_key_seq if c.isupper() or c == '-'])
-
-    if not old_query or not mpnn_seq:
-        return None
-
-    # Initialize alignment with free end gaps to support sub-stringing and extensions
-    aligner = PairwiseAligner()
-    aligner.mode = 'global'
-    aligner.match_score = 2
-    aligner.mismatch_score = -1
-    aligner.open_gap_score = -2
-    aligner.extend_gap_score = -0.5
-    aligner.target_end_gap_score = 0.0
-    aligner.query_end_gap_score = 0.0
-
-    alignments = aligner.align(mpnn_seq, old_query)
-    if not alignments:
-        return None
-
-    best_alignment = alignments[0]
-
-    # Reconstruct exact alignment strings from block mapping coordinates
-    target_aligned = ""
-    query_aligned = ""
-    t_idx = 0
-    q_idx = 0
-
-    for (t_start, t_end), (q_start, q_end) in zip(best_alignment.aligned[0], best_alignment.aligned[1]):
-        if t_start > t_idx:
-            target_aligned += mpnn_seq[t_idx:t_start]
-            query_aligned += "-" * (t_start - t_idx)
-        if q_start > q_idx:
-            query_aligned += old_query[q_idx:q_start]
-            target_aligned += "-" * (q_start - q_idx)
-
-        target_aligned += mpnn_seq[t_start:t_end]
-        query_aligned += old_query[q_start:q_end]
-        t_idx = t_end
-        q_idx = q_end
-
-    if t_idx < len(mpnn_seq):
-        target_aligned += mpnn_seq[t_idx:]
-        query_aligned += "-" * (len(mpnn_seq) - t_idx)
-    if q_idx < len(old_query):
-        query_aligned += old_query[q_idx:]
-        target_aligned += "-" * (len(old_query) - q_idx)
-
-    def get_a3m_blocks(seq):
-        """Tokenize an A3M sequence into match-state blocks with attached unaligned insertions."""
-        blocks = []
-        current_block = ""
-        for char in seq:
-            if char.isupper() or char == '-':
-                if current_block:
-                    blocks.append(current_block)
-                current_block = char
+    # 1. Parse the original A3M file
+    names = []
+    seqs = []
+    with open(input_a3m_path, 'r') as f:
+        name, seq = "", []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if name:
+                    names.append(name)
+                    seqs.append("".join(seq))
+                name = line[1:]
+                seq = []
             else:
-                current_block += char
-        if current_block:
-            blocks.append(current_block)
+                seq.append(line)
+        if name:
+            names.append(name)
+            seqs.append("".join(seq))
 
-        if blocks and blocks[0] and blocks[0][0].islower():
-            leading = blocks[0]
-            blocks = blocks[1:]
-        else:
-            leading = ""
-        return leading, blocks
+    if not seqs:
+        raise ValueError("No sequences found in A3M file.")
 
-    # Validate coordinate parity
-    _, query_blocks = get_a3m_blocks(a3m_key_seq)
-    if len(query_blocks) != len(old_query):
-        return None
+    # Extract the old query and ensure standard A3M format (no insertions or gaps)
+    old_query_seq = "".join([c for c in seqs[0] if c.isupper()])
+    new_query_clean = new_query_seq.replace('-', '').upper()
+    print(f"DEBUG: new_query_clean: {new_query_clean}")
+    print(f"DEBUG: old_query_seq: {old_query_seq}")
+    # 2. Compute global pairwise alignment between old and new queries
+    aligner = Align.PairwiseAligner()
+    aligner.mode = 'global'
+    try:
+        from Bio.Align import substitution_matrices
+        aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    except ImportError:
+        aligner.match_score = 2
+        aligner.mismatch_score = -1
 
-    new_seqs = []
-    for idx in range(1, len(a3m_seqs)):
-        seq = a3m_seqs[idx]
-        leading, blocks = get_a3m_blocks(seq)
+    aligner.open_gap_score = -5
+    aligner.extend_gap_score = -1
 
-        if len(blocks) != len(old_query):
-            return None
+    best_aln = aligner.align(new_query_clean, old_query_seq)[0]
+    t_str = str(best_aln[0])  # Target: new query path
+    q_str = str(best_aln[1])  # Query: old query path
 
-        new_seq_parts = [leading]
-        block_idx = 0
+    # 3. Process and map each alignment sequence
+    with open(output_a3m_path, 'w') as out:
+        out.write(f">query\n{new_query_clean}\n")
 
-        # Traverse alignment coordinate matrix
-        for t_char, q_char in zip(target_aligned, query_aligned):
-            if t_char != '-' and q_char != '-':
-                # Match/Mismatch
-                new_seq_parts.append(blocks[block_idx])
-                block_idx += 1
-            elif t_char != '-' and q_char == '-':
-                # Insertion mapped to MPNN topology -> apply deletion gap to MSA
-                new_seq_parts.append('-')
-            elif t_char == '-' and q_char != '-':
-                # Deletion mapped to MPNN topology -> terminate obsolete MSA block
-                block_idx += 1
+        for name, seq in zip(names[1:], seqs[1:]):
+            # Deconstruct the sequence into distinct match and insertion states
+            match_states = []
+            insertions = []
+            current_ins = []
 
-        new_seqs.append("".join(new_seq_parts))
+            for char in seq:
+                if char.isupper() or char == '-':
+                    insertions.append("".join(current_ins))
+                    current_ins = []
+                    match_states.append(char)
+                elif char.islower():
+                    current_ins.append(char)
+            insertions.append("".join(current_ins))
 
-    return new_seqs
+            new_match_states = []
+            new_insertions = []
+            old_idx = 0
+            current_new_ins = insertions[0] if insertions else ""
+
+            # Re-map positional coordinates based on the alignment path
+            for t_char, q_char in zip(t_str, q_str):
+                if t_char != '-' and q_char != '-':
+                    # Alignment match retained
+                    new_insertions.append(current_new_ins)
+                    M = match_states[old_idx] if old_idx < len(match_states) else '-'
+                    new_match_states.append(M)
+                    old_idx += 1
+                    current_new_ins = insertions[old_idx] if old_idx < len(insertions) else ""
+
+                elif t_char == '-' and q_char != '-':
+                    # Old match state demoted to an insertion state
+                    M = match_states[old_idx] if old_idx < len(match_states) else '-'
+                    if M != '-':
+                        current_new_ins += M.lower()
+                    old_idx += 1
+                    current_new_ins += insertions[old_idx] if old_idx < len(insertions) else ""
+
+                elif t_char != '-' and q_char == '-':
+                    # New query insertion promotes a new match state
+                    new_insertions.append(current_new_ins)
+                    new_match_states.append('-')
+                    current_new_ins = ""
+
+            new_insertions.append(current_new_ins)
+
+            # Reconstruct the transformed sequence string
+            final_seq_parts = []
+            for i in range(len(new_match_states)):
+                final_seq_parts.append(new_insertions[i])
+                final_seq_parts.append(new_match_states[i])
+            final_seq_parts.append(new_insertions[-1])
+
+            out.write(f">{name}\n{''.join(final_seq_parts)}\n")
 
 
 def make_alignment_file_boltz(sequence_id, sequence, alignment_dir, output_dir):
@@ -681,50 +687,9 @@ def make_alignment_file_boltz(sequence_id, sequence, alignment_dir, output_dir):
 
         a3m_path = os.path.join(alignment_dir, matching_file)
 
-        headers = []
-        seqs = []
-        with open(a3m_path, "r") as f:
-            header = None
-            current_seq = []
-            for line in f:
-                line = sanitize_string(line.strip())
-                if not line or line.startswith('#'):
-                    continue
-                if line.startswith('>'):
-                    if header is not None:
-                        headers.append(header)
-                        seqs.append("".join(current_seq))
-                    header = line
-                    current_seq = []
-                else:
-                    current_seq.append(line)
-
-            if header is not None:
-                headers.append(header)
-                seqs.append("".join(current_seq))
-
-        if not seqs:
-            print(f"Warning: Alignment file {matching_file} is empty. Writing base FASTA only.")
-            with open(output_path, "w") as f:
-                f.write(f">{sequence_id}_{chain_id}\n{mpnn_chain_seq}\n")
-            continue
-
         # Execute mapping and gap projection computation
-        aligned_msa = align_and_pad_a3m(mpnn_chain_seq, seqs)
+        recalculate_a3m(a3m_path, mpnn_chain_seq, output_path)
 
-        with open(output_path, "w") as f:
-            f.write(f">{sequence_id}_{chain_id}\n")
-            f.write(f"{mpnn_chain_seq}\n")
-
-            if aligned_msa is not None:
-                for h, s in zip(headers[1:], aligned_msa):
-                    f.write(f"{h}\n{s}\n")
-            else:
-                # System fallback for discontinuous or structurally unparseable A3M matrices
-                print(f"Warning: Failed to map sequence topology for chain {chain_id}. "
-                      f"Applying direct substitution; resultant MSA continuity may fracture.")
-                for j in range(1, len(seqs)):
-                    f.write(f"{headers[j]}\n{seqs[j]}\n")
 
 
 def make_alignment_file(cfg, trb_path, pdb_file, mpnn_seq, alignments_path, output):
@@ -2038,7 +2003,7 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
             breaks = contig.count("/0 ") + 1
 
         fixed_res = dict(zip(abeceda, [[] for _ in range(breaks)]))
-        #print(f"Fixed res (according to contig chain breaks): {fixed_res}")
+        print(f"DEBUG: Fixed res (according to contig chain breaks): {fixed_res}")
 
         # This is only good if multiple chains due to symmetry: all of them are equal; ProteinMPNN expects fixed_res as 1-based, resetting for each chain.
         # TODO: Fix for multi-chain receptors 
@@ -2054,12 +2019,12 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
                 if res not in con_set
             ]
         complex_con_ref_idx0 = copy.deepcopy(sorted(list(complex_con_ref_idx0) + list(provide_seq_residues)))
-        #print(f"DEBUG: complex_con_ref_idx0 (combined con_ref_idx0 and provide_seq_residues): {complex_con_ref_idx0}")
+        print(f"DEBUG: complex_con_ref_idx0 (combined con_ref_idx0 and provide_seq_residues): {complex_con_ref_idx0}")
         complex_con_ref_pdb_idx = []
         for id0 in complex_con_ref_idx0:  # Just define con_hal_idx from inpaint_seq and ignore everything else. This should work
             complex_con_ref_pdb_idx.append(all_residues_reference[id0])
-        #print(f"DEBUG complex_con_ref_pdb_idx: {complex_con_ref_pdb_idx}")
-
+        print(f"DEBUG complex_con_ref_pdb_idx: {complex_con_ref_pdb_idx}")
+        print(f"DEBUG con_hal_idx: {con_hal_idx}")
         for (chain, idx), (chain_from_input, idx_from_input) in zip(con_hal_idx, complex_con_ref_pdb_idx):
             if not skipRfDiff:
                 #print(f"DEBUG: {(chain, idx), (chain_from_input, idx_from_input)} in con_hal_idx and complex_con_ref_pdb_idx")
