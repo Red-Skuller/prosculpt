@@ -5,8 +5,7 @@ import os
 import argparse
 import yaml
 
-parser = argparse.ArgumentParser(epilog=(
-    '#### Any other arguments passed will be passed as they are to prosculpt. If including output_dir, please include it first ####\n**** Important: hydra config overrides should be put before -cd and -cn ****\nExample: python slurm_runner.py 1 multipassinpaintseq_throw  output_dir="Examples/Examples_out/multipass_inpaintseq_throw" +throw=1 +cycle=0 -cd Examples -cn multipass_inpaintseq'))
+parser=argparse.ArgumentParser(epilog=('#### Any other arguments passed will be passed as they are to prosculpt. If including output_dir, please include it first ####\n**** Important: hydra config overrides should be put before -cd and -cn ****\nExample: python slurm_runner.py 1 multipassinpaintseq_throw  output_dir="Examples/Examples_out/multipass_inpaintseq_throw" +throw=1 +cycle=0 -cd Examples -cn multipass_inpaintseq'))
 
 parser.add_argument('yaml_file', help='Prosculpt input file.')
 parser.add_argument('-d', '--dry-run', action="store_true", help="Print command but do not run.")
@@ -41,6 +40,8 @@ else:
 
 out_command_file = f"ps2slurm_{task_name}_{int(time.time_ns())}.txt"
 
+
+
 with open(out_command_file, 'w') as f:
     for i in range(1, n + 1):
         arguments = []
@@ -54,8 +55,7 @@ with open(out_command_file, 'w') as f:
                 if output_dir[-1:] != "/":  # Add the task number
                     output_dir += "/"
                 output_dir += f"{i:02d}"
-                arguments.append(
-                    output_dir)  # This will override the output present in the yaml file with the one with the tasknumber
+                arguments.append(output_dir) #This will override the output present in the yaml file with the one with the tasknumber
 
         if not output_dir_in_args:
             output_dir = yaml_data["output_dir"]
@@ -70,8 +70,8 @@ with open(out_command_file, 'w') as f:
 
         # print("+output_dir="+output_dir)
 
-        cmdline = " ".join(arguments)  # join all arguments passed that aren't number of tasks or task name
-        line = f"""python {slurm_runner_path}/rfdiff_mpnn_af2_merged.py {cmdline}"""
+        cmdline = " ".join(arguments) #join all arguments passed that aren't number of tasks or task name
+        line = f"""python {slurm_runner_path}/prosculpt_run.py {cmdline}"""
         print(line, file=f)
 
 print(f"Slurm command can be found in {out_command_file}")

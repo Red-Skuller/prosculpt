@@ -3,7 +3,7 @@ Protein design and sculpting using Rosetta and Deep learning methods (RFDiff and
 
 ![image](pipeline_pic.png)
 ## Description 
-The script `rfdiff_mpnn_af2_merged.py` runs a pipeline to automate the processes of generating protein structures with RFdiffusion, sequence generation with ProteinMPNN, and folding and evaluation with AF2 and Rosetta. Specifically, the script uses motif scaffolding to generate structures (see [RFdiffusion github repository](https://github.com/RosettaCommons/RFdiffusion/blob/main/README.md)).
+The script `prosculpt_run.py` runs a pipeline to automate the processes of generating protein structures with RFdiffusion, sequence generation with ProteinMPNN, and folding and evaluation with AF2 and Rosetta. Specifically, the script uses motif scaffolding to generate structures (see [RFdiffusion github repository](https://github.com/RosettaCommons/RFdiffusion/blob/main/README.md)).
 
 The main steps are as follows:
 1. The main inputs are a protein PDB file and a yaml file that specifies how to generate the new structure around the original protein (which parts to keep, etc.). 
@@ -13,7 +13,7 @@ The main steps are as follows:
 6. Additional evaluation parameters are calculated for these structures using a separate script with Rosetta.
 7. The final output is a CSV file containing AF2 structure path, evaluation parameters etc.
 
-A working Collab can be found [here](https://colab.research.google.com/drive/1LHT7mdQngWrIJfiUki6xcEzaFCfEe0VR?usp=sharing)
+A working Collab can be found [here](https://colab.research.google.com/github/ajasja/prosculpt/blob/main/Prosculpt_Colab.ipynb)
 
 ## Requirements  
 The script requires the prosculpt package. It assumes that RFdiffusion, proteinMPNN, and AF2 are installed and that the correct paths are provided in the `installation.yaml` config file. Additionall biopython, hydra-core, pandas and scipy and pyRosetta are required.  
@@ -99,7 +99,7 @@ python slurm_runner.py job_parameters.yaml
 
 If you want to run Prosculpt locally, it can be called as
 ```bash
-python rfdiff_mpnn_af2_merged.py -cd config_directory -cn config_file_name
+python prosculpt_run.py -cd config_directory -cn config_file_name
 ```
 
 (note that the config file name must be written without the yaml extension)
