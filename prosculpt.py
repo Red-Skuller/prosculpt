@@ -49,7 +49,79 @@ def _boltz_next_free_id(used_ids):
     )
 
 
-def _merge_boltz_extras(data, cfg):
+def _remap_boltz_ref(ref, remap):
+    """Remap a single chain/residue reference from input PDB coordinates to the
+    generated (designed) sequence coordinates.
+
+    ref = [chain, resnum] (pocket contact / contact token) or
+          [chain, resnum, atom_name] (bond constraint).
+    remap(chain, resnum) -> (out_chain, out_resnum) or None.
+
+    If remap is None, the residue is not a PDB-mapped input residue (e.g. it is
+    a static ligand/metal chain), or the residue is not numeric, the reference
+    is returned unchanged.
+    """
+    if remap is None or not isinstance(ref, (list, tuple)) or len(ref) < 2:
+        return ref
+    chain, resnum = ref[0], ref[1]
+    try:
+        resnum_int = int(resnum)
+    except (TypeError, ValueError):
+        return ref
+    mapped = remap(chain, resnum_int)
+    if mapped is None:
+        return ref
+    out_chain, out_resnum = mapped
+    rest = list(ref[2:])  # e.g. atom name for bond constraints
+    return [out_chain, out_resnum] + rest
+
+
+def build_boltz_ref_to_pos(cfg, trb_file):
+    """Build a mapping {(input_chain, input_resseq): flat_position} for one
+    RFDiffusion design, used to remap boltz_extras constraint references from
+    input PDB coordinates to the generated (designed) sequence coordinates.
+
+    flat_position is the 0-based position in the generated sequence (the
+    concatenation of the designed chains), matching the trb 'hal' indices.
+    Because it is derived from the actual trb mapping, it correctly handles
+    arbitrary contigs - including length changes (e.g. [A1-25/1-5/A30-50])
+    and chain re-mapping - not just equal-length replacements.
+
+    Returns None when the mapping cannot be built (no input PDB, missing trb,
+    or missing trb fields) - callers should then leave references as-is.
+    """
+    ref_path = cfg.get("pdb_path", None)
+    if ref_path is None or not trb_file or not os.path.exists(trb_file):
+        return None
+    try:
+        with open(trb_file, "rb") as f:
+            trb_data = pickle.load(f)
+        all_res, _ = get_all_residues(ref_path)
+    except Exception as e:
+        print(f"WARNING: could not build boltz_extras residue remap: {e}")
+        return None
+
+    ref_idx_list = list(
+        trb_data.get("complex_con_ref_idx0", trb_data.get("con_ref_idx0", []))
+    )
+    hal_idx_list = list(
+        trb_data.get("complex_con_hal_idx0", trb_data.get("con_hal_idx0", []))
+    )
+    if not ref_idx_list or len(ref_idx_list) != len(hal_idx_list):
+        return None
+
+    ref_to_pos = dict(
+        zip((int(x) for x in ref_idx_list), (int(x) for x in hal_idx_list))
+    )
+    residue_to_pos = {}
+    for ref_i, (chain, resseq) in enumerate(all_res):
+        pos = ref_to_pos.get(ref_i)
+        if pos is not None:
+            residue_to_pos[(chain, resseq)] = pos
+    return residue_to_pos
+
+
+def _merge_boltz_extras(data, cfg, remap=None):
     """Merge static additions from cfg.boltz_extras into a boltz input dict.
 
     The config block mirrors the Boltz input schema (see boltz docs):
@@ -106,6 +178,25 @@ def _merge_boltz_extras(data, cfg):
         used_ids.update(ids if isinstance(spec["id"], list) else [spec["id"]])
         data["sequences"].append({etype: spec})
 
+    # Remap chain/residue references in constraints from input PDB coordinates
+    # to the generated (designed) sequence coordinates, so that contacts stay
+    # attached to the right residues even when the contig changes lengths or
+    # re-maps chains. Static references (ligand/metal chain ids) are left as-is.
+    if remap is not None:
+        for c in extras.get("constraints", []) or []:
+            if "pocket" in c and "contacts" in c["pocket"]:
+                c["pocket"]["contacts"] = [
+                    _remap_boltz_ref(r, remap) for r in c["pocket"]["contacts"]
+                ]
+            if "contact" in c:
+                for tok in ("token1", "token2"):
+                    if tok in c["contact"]:
+                        c["contact"][tok] = _remap_boltz_ref(c["contact"][tok], remap)
+            if "bond" in c:
+                for atom in ("atom1", "atom2"):
+                    if atom in c["bond"]:
+                        c["bond"][atom] = _remap_boltz_ref(c["bond"][atom], remap)
+
     for key in ("constraints", "templates", "properties", "version"):
         if extras.get(key) is not None:
             data[key] = extras[key]
@@ -113,7 +204,7 @@ def _merge_boltz_extras(data, cfg):
 
 
 def make_boltz_input_yaml(
-    cfg, model_id, mpnn_sequence, output_dir, input_alignment_dir
+    cfg, model_id, mpnn_sequence, output_dir, input_alignment_dir, ref_to_pos=None
 ):
     chain_ids = []
     sequences = []
@@ -176,9 +267,31 @@ def make_boltz_input_yaml(
                 }
             )
 
+    # Build flat-position -> (designed chain id, 1-based residue number) using
+    # the SAME chain order and alphabetic cleaning as the sequences written
+    # above. This is the target coordinate system for remapping boltz_extras
+    # constraint references (which the user writes in input PDB coordinates).
+    remap = None
+    if ref_to_pos:
+        pos_to_chain_res = {}
+        flat = 0
+        for i, chain_seq in enumerate(split_chains):
+            cleaned_len = sum(1 for c in chain_seq if c.isalpha())
+            for j in range(cleaned_len):
+                pos_to_chain_res[flat + j] = (chain_ids[i], j + 1)
+            flat += cleaned_len
+
+        def remap(chain, resnum, _pos=pos_to_chain_res, _ref=ref_to_pos):
+            pos = _ref.get((chain, resnum))
+            if pos is None:
+                return None
+            return _pos.get(pos)
+
     # Add user-specified static additions (ligands, RNA/DNA, constraints,
     # templates, affinity properties) from the boltz_extras config block.
-    data = _merge_boltz_extras(data, cfg)
+    # Constraint chain/residue references are remapped from input PDB
+    # coordinates to the newly formed chains (handles length changes).
+    data = _merge_boltz_extras(data, cfg, remap=remap)
 
     with open(f"{output_dir}/{model_id}.yaml", "w") as outfile:
         yaml.dump(data, outfile, default_flow_style=False)

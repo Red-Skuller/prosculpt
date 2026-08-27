@@ -14,6 +14,15 @@ prediction_model: AF3 #Colabfold, Boltz2 or AF3
 skipRfDiff: False # Whether to skip RfDiff and only redesign a few residues with ProteinMPNN and AF
 designable_residues: [A8, A9, A10, A13, A85, B, C] # Residues to be redesigned when skipRfDiff == True. Also add letters of all other chains in the PDB you wish to have in the end structure.
 
+# Only used when skipRfDiff == False. Residues (input PDB coordinates) that
+# ProteinMPNN should redesign IN ADDITION to the residues RFDiffusion generated.
+# By default MPNN's design set == RFDiff's design set (only the newly generated
+# backbone is re-sequenced). Use this when the contig only designs a subset of
+# the region you want to change: keep the rest of the backbone fixed in the
+# contig and list those residues here, e.g. [A12, A20-A45, B] ("B" = whole chain).
+# If the affected output chains are not in chains_to_design, add them there.
+mpnn_designable_residues: null
+
 # ---------------------------------------------------------------------------
 # Boltz2-only options: static additions to the generated boltz.yaml files.
 #
@@ -22,6 +31,16 @@ designable_residues: [A8, A9, A10, A13, A85, B, C] # Residues to be redesigned w
                       # Chain IDs: designed protein chains are labeled A, B, C...
                       # by position in the colon-separated MPNN sequence. Extra
                       # entries must use free letters (or omit the id to auto-assign).
+                      #
+                      # IMPORTANT - coordinates for constraint contacts:
+                      #   Write pocket.contacts / contact.token1,token2 /
+                      #   bond.atom1,atom2 PROTEIN references in INPUT PDB
+                      #   coordinates (chain + residue of your pdb_path file).
+                      #   Prosculpt automatically remaps them onto the newly
+                      #   formed chains (handles length changes and chain
+                      #   re-mapping, e.g. contig [A1-25/1-5/A30-50]). Ligand/
+                      #   metal chain ids (binder, token pointing at a ligand)
+                      #   are static and are passed through unchanged.
 #
 # Example (uncomment and adapt):
 # boltz_extras:
@@ -30,7 +49,7 @@ designable_residues: [A8, A9, A10, A13, A85, B, C] # Residues to be redesigned w
 #     - ligand: {id: D, smiles: 'CC(=O)Oc1ccccc1C(=O)O'}  # SMILES ligand
 #     - ligand: {id: E, ccd: [EDO, GLU]}             # multi-residue ligand
 #     - rna:    {id: F, sequence: GCAUAGC}           # RNA chain (or dna:)
-#   constraints:
+#   constraints:  # protein refs in INPUT PDB coords; auto-remapped to new chains
 #     - pocket: {binder: C, contacts: [[A, 42], [B, 10]], max_distance: 6.0}
 #     # - contact: {token1: [A, 1], token2: [C, 1], max_distance: 6.0}
 #     # - bond: {atom1: [A, 1, CA], atom2: [B, 2, N]}

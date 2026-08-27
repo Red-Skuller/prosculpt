@@ -882,6 +882,14 @@ def do_cycling(cfg):
                     alignment_inputs_dir = os.path.join(model_dir, "alignment_inputs")
                     os.makedirs(alignment_inputs_dir, exist_ok=True)
                     input_yaml_files = []
+                    # Input-PDB -> generated-sequence residue map, used to remap
+                    # boltz_extras constraint contacts onto the newly formed chains.
+                    boltz_ref_to_pos = prosculpt.build_boltz_ref_to_pos(
+                        cfg,
+                        os.path.join(
+                            cfg.rfdiff_out_dir, "_" + str(rf_model_num) + ".trb"
+                        ),
+                    )
                     with open(fasta_file) as fasta_f:
                         a3m_filename = ""
                         for line in fasta_f:
@@ -911,6 +919,7 @@ def do_cycling(cfg):
                                     mpnn_seq,
                                     yaml_dir,
                                     alignment_inputs_dir,
+                                    ref_to_pos=boltz_ref_to_pos,
                                 )
                                 run_boltz_yaml_postprocess(
                                     cfg, custom_yaml_path, sequence_id
@@ -1010,6 +1019,14 @@ def do_cycling(cfg):
                 elif cfg.prediction_model == "Boltz2":  # If using Boltz
                     yaml_dir = os.path.join(model_dir, "yaml_inputs")
                     os.makedirs(yaml_dir, exist_ok=True)
+                    # Input-PDB -> generated-sequence residue map, used to remap
+                    # boltz_extras constraint contacts onto the newly formed chains.
+                    boltz_ref_to_pos = prosculpt.build_boltz_ref_to_pos(
+                        cfg,
+                        os.path.join(
+                            cfg.rfdiff_out_dir, "_" + str(rf_model_num) + ".trb"
+                        ),
+                    )
 
                     with open(fasta_file) as fasta_f:
                         for line in fasta_f:
@@ -1029,6 +1046,7 @@ def do_cycling(cfg):
                                     mpnn_seq,
                                     yaml_dir,
                                     None,
+                                    ref_to_pos=boltz_ref_to_pos,
                                 )
                                 run_boltz_yaml_postprocess(
                                     cfg, custom_yaml_path, sequence_id
