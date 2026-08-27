@@ -151,6 +151,7 @@ def general_config_prep(cfg):
             log.info(
                 f"Chains to design (according to contig chain breaks): {cfg.chains_to_design}"
             )
+        cfg.mpnn_contig = cfg.get("mpnn_contig", None)
 
     for directory in [cfg.rfdiff_out_dir, cfg.mpnn_out_dir, cfg.af2_out_dir]:
         os.makedirs(directory, exist_ok=True)

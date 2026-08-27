@@ -17,6 +17,36 @@ import re
 import yaml
 import copy
 
+def map_mpnn_contig(mpnn_contig, trb_data, chainResidOffset, skipRfDiff, con_hal_pdb_idx_complete):
+    fixed_res = {}
+    if not mpnn_contig:
+        return fixed_res
+
+    ref_to_hal = {}
+    if not skipRfDiff and trb_data:
+        if "complex_con_ref_pdb_idx" in trb_data:
+            ref_idx = trb_data["complex_con_ref_pdb_idx"]
+            hal_idx = trb_data["complex_con_hal_pdb_idx"]
+        else:
+            ref_idx = trb_data.get("con_ref_pdb_idx", [])
+            hal_idx = trb_data.get("con_hal_pdb_idx", [])
+        for (ref_chain, ref_res), (hal_chain, hal_res) in zip(ref_idx, hal_idx):
+            ref_to_hal[(ref_chain, ref_res)] = (hal_chain, hal_res)
+    else:
+        for chain, res in con_hal_pdb_idx_complete:
+            ref_to_hal[(chain, res)] = (chain, res)
+
+    contig_segments = mpnn_contig.split(",")
+    for segment in contig_segments:
+        chain = segment[0]
+        start, end = map(int, segment[1:].split("-"))
+        for res_num in range(start, end + 1):
+            original_pos = (chain, res_num)
+            if original_pos in ref_to_hal:
+                new_chain, new_res = ref_to_hal[original_pos]
+                fixed_res.setdefault(new_chain, []).append(new_res - chainResidOffset.get(new_chain, 0))
+
+    return fixed_res
 
 def make_boltz_input_yaml(
     cfg, model_id, mpnn_sequence, output_dir, input_alignment_dir
@@ -2002,7 +2032,17 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
 
         fixed_res = dict(zip(abeceda, [[] for _ in range(breaks)]))
         print(f"DEBUG: Fixed res (according to contig chain breaks): {fixed_res}")
-
+        if cfg.get("mpnn_contig", None):
+            trb_input = None if skipRfDiff else trb_data
+            fixed_res = map_mpnn_contig(cfg.mpnn_contig, trb_input, chainResidOffset, skipRfDiff,
+                                        con_hal_pdb_idx_complete)
+        else:
+            for (chain, idx), (chain_from_input, idx_from_input) in zip(con_hal_idx, complex_con_ref_pdb_idx):
+                if not skipRfDiff:
+                    if trb_data["inpaint_seq"][idx - 1]:
+                        fixed_res.setdefault(chain, list()).append(idx - chainResidOffset[chain])
+                else:
+                    fixed_res.setdefault(chain, list()).append(idx)
         # This is only good if multiple chains due to symmetry: all of them are equal; ProteinMPNN expects fixed_res as 1-based, resetting for each chain.
         # TODO: Fix for multi-chain receptors 
 
