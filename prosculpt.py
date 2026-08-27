@@ -15,6 +15,7 @@ import homooligomer_rmsd
 from Bio.Align import PairwiseAligner
 from Bio.Data import IUPACData
 import re
+import io
 import yaml
 import copy
 from omegaconf import OmegaConf
@@ -87,38 +88,58 @@ def build_boltz_ref_to_pos(cfg, trb_file):
     arbitrary contigs - including length changes (e.g. [A1-25/1-5/A30-50])
     and chain re-mapping - not just equal-length replacements.
 
-    Returns None when the mapping cannot be built (no input PDB, missing trb,
-    or missing trb fields) - callers should then leave references as-is.
+    The mapping is content-based: the trb stores the PDB-mapped contig
+    positions in contig order as two parallel lists,
+        complex_con_ref_pdb_idx[j] = (chain, resseq) in the input PDB
+        complex_con_hal_idx0[j]    = position in the generated sequence
+    so it does not assume RFDiff's and Biopython's residue lists line up
+    positionally (they don't for multi-model PDBs, where RFDiff reads every
+    model and Biopython only the first).
+
+    Returns None when the mapping cannot be built (missing trb, or missing
+    trb fields) - callers should then leave references as-is.
     """
-    ref_path = cfg.get("pdb_path", None)
-    if ref_path is None or not trb_file or not os.path.exists(trb_file):
+    if not trb_file or not os.path.exists(trb_file):
         return None
     try:
         with open(trb_file, "rb") as f:
             trb_data = pickle.load(f)
-        all_res, _ = get_all_residues(ref_path)
+        trb_ref_pdb = trb_data.get(
+            "complex_con_ref_pdb_idx", trb_data.get("con_ref_pdb_idx", None)
+        )
+        hal_idx_list = list(
+            trb_data.get("complex_con_hal_idx0", trb_data.get("con_hal_idx0", []))
+        )
     except Exception as e:
         print(f"WARNING: could not build boltz_extras residue remap: {e}")
         return None
-
-    ref_idx_list = list(
-        trb_data.get("complex_con_ref_idx0", trb_data.get("con_ref_idx0", []))
-    )
-    hal_idx_list = list(
-        trb_data.get("complex_con_hal_idx0", trb_data.get("con_hal_idx0", []))
-    )
-    if not ref_idx_list or len(ref_idx_list) != len(hal_idx_list):
+    if trb_ref_pdb is None:
+        # older trb without a content-based (chain, resseq) list: fall back to
+        # positional indexing into the input PDB residue list (works when
+        # RFDiff's and Biopython's parsers agree on the residues)
+        ref_path = cfg.get("pdb_path", None)
+        if ref_path is None or not os.path.exists(ref_path):
+            return None
+        try:
+            all_res, _ = get_all_residues(ref_path)
+            ref_idx_list = list(
+                trb_data.get("complex_con_ref_idx0", trb_data.get("con_ref_idx0", []))
+            )
+        except Exception as e:
+            print(f"WARNING: could not build boltz_extras residue remap: {e}")
+            return None
+        if not ref_idx_list or len(ref_idx_list) != len(hal_idx_list):
+            return None
+        return {
+            all_res[ref_i]: int(p)
+            for ref_i, p in zip(ref_idx_list, hal_idx_list)
+            if ref_i < len(all_res)
+        }
+    if len(trb_ref_pdb) != len(hal_idx_list):
         return None
-
-    ref_to_pos = dict(
-        zip((int(x) for x in ref_idx_list), (int(x) for x in hal_idx_list))
-    )
-    residue_to_pos = {}
-    for ref_i, (chain, resseq) in enumerate(all_res):
-        pos = ref_to_pos.get(ref_i)
-        if pos is not None:
-            residue_to_pos[(chain, resseq)] = pos
-    return residue_to_pos
+    return {
+        (str(r[0]), int(r[1])): int(p) for r, p in zip(trb_ref_pdb, hal_idx_list)
+    }
 
 
 def _merge_boltz_extras(data, cfg, remap=None):
@@ -2057,12 +2078,37 @@ class NumpyInt64Encoder(json.JSONEncoder):
         return super(NumpyInt64Encoder, self).default(obj)
 
 
+def parse_pdb_structure(pdb_file):
+    """Parse a PDB with Biopython, moving CONECT records to the end of the
+    file first.
+
+    Biopython's PDBParser treats the first CONECT record as the END of the
+    atomic coordinates. Some tools write CONECT records in the middle of the
+    file (e.g. between MODEL sections), which silently truncates the parse -
+    every residue after the CONECT block is dropped (RFDiff's line-based
+    parser does not have this limitation, so the two tools disagree on the
+    residue list). Moving the CONECT block to its canonical position (before
+    the END record) makes the full file readable.
+    """
+    with open(pdb_file) as f:
+        lines = f.readlines()
+    conect = [l for l in lines if l[:6] == "CONECT"]
+    if not conect:
+        return PDBParser(QUIET=True).get_structure("protein", pdb_file)
+    rest = [l for l in lines if l[:6] != "CONECT"]
+    for i in range(len(rest) - 1, -1, -1):
+        if rest[i][:3] == "END" and rest[i][3:4] == " ":
+            rest[i:i] = conect
+            break
+    else:
+        rest = rest + conect
+    return PDBParser(QUIET=True).get_structure("protein", io.StringIO("".join(rest)))
+
 def getChainResidOffsets(pdb_file, designable_residues):
     chainResidOffset = {}
     con_hal_idx = []
 
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("protein", pdb_file)
+    structure = parse_pdb_structure(pdb_file)
 
     global_residue_index = 1
 
@@ -2087,8 +2133,7 @@ def getChainResidOffsets(pdb_file, designable_residues):
     return chainResidOffset, con_hal_idx
 
 def get_all_residues(pdb_file):
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("protein", pdb_file)
+    structure = parse_pdb_structure(pdb_file)
 
     residues = []
     residue_indices=[]
@@ -2235,9 +2280,52 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
             ]
         complex_con_ref_idx0 = copy.deepcopy(sorted(list(complex_con_ref_idx0) + list(provide_seq_residues)))
         print(f"DEBUG: complex_con_ref_idx0 (combined con_ref_idx0 and provide_seq_residues): {complex_con_ref_idx0}")
-        complex_con_ref_pdb_idx = []
-        for id0 in complex_con_ref_idx0:  # Just define con_hal_idx from inpaint_seq and ignore everything else. This should work
-            complex_con_ref_pdb_idx.append(all_residues_reference[id0])
+        if not skipRfDiff:
+            # Content-based (chain, resseq) for all PDB-mapped contig
+            # positions, in contig order - straight from the trb. The old code
+            # derived these by indexing the Biopython residue list
+            # (all_residues_reference) with RFDiff's own pdb_idx indices
+            # (complex_con_ref_idx0). That only works if both parsers see
+            # exactly the same residues in the same order, which is not true
+            # for e.g. multi-model PDBs (RFDiff reads every model, Biopython
+            # only the first one) and caused an IndexError.
+            trb_ref_pdb_idx = trb_data.get(
+                "complex_con_ref_pdb_idx", trb_data.get("con_ref_pdb_idx", None)
+            )
+            if trb_ref_pdb_idx is not None:
+                complex_con_ref_pdb_idx = [
+                    (str(r[0]), int(r[1])) for r in trb_ref_pdb_idx
+                ]
+                # provide_seq (partial diffusion) positions are inpainted but
+                # have no PDB-mapped (chain, resseq); add placeholders so the
+                # list is as long as con_hal_idx for the zip below (values are
+                # not used there).
+                complex_con_ref_pdb_idx += [("_", 0)] * len(provide_seq_residues)
+            else:
+                # older trb without a content-based (chain, resseq) list: fall
+                # back to positional indexing (works when the parsers agree)
+                try:
+                    complex_con_ref_pdb_idx = [
+                        all_residues_reference[id0]
+                        for id0 in complex_con_ref_idx0
+                    ]
+                except IndexError:
+                    print(
+                        "WARNING: trb indices do not line up with the Biopython "
+                        "residue list and the trb has no con_ref_pdb_idx; "
+                        "using placeholders (values are unused downstream)."
+                    )
+                    complex_con_ref_pdb_idx = [
+                        ("_", 0) for _ in complex_con_ref_idx0
+                    ]
+            while len(complex_con_ref_pdb_idx) < len(con_hal_idx):
+                complex_con_ref_pdb_idx.append(("_", 0))
+        else:
+            # safe here: complex_con_ref_idx0 was built by enumerating
+            # all_residue_indices_reference itself
+            complex_con_ref_pdb_idx = [
+                all_residues_reference[id0] for id0 in complex_con_ref_idx0
+            ]
         print(f"DEBUG complex_con_ref_pdb_idx: {complex_con_ref_pdb_idx}")
         print(f"DEBUG con_hal_idx: {con_hal_idx}")
         for (chain, idx), (chain_from_input, idx_from_input) in zip(con_hal_idx, complex_con_ref_pdb_idx):
@@ -2266,8 +2354,13 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
         # set mpnn_designable_residues (input PDB coordinates) to a list of
         # residues whose backbones stay fixed in the contig but which MPNN
         # should re-sequence anyway. Accepted specs: "A12" (single residue),
-        # "A12-A45" (range, same chain), "B" (whole chain).
+        # "A12-A45" (range, same chain), "B" (whole chain). A YAML list or a
+        # single string like "[A1-A4, A6-A8, B]" both work.
         mpnn_designable = cfg.get("mpnn_designable_residues", None)
+        if isinstance(mpnn_designable, str):
+            mpnn_designable = [
+                t for t in re.split(r"[,\[\]\s]+", mpnn_designable) if t
+            ]
         if mpnn_designable and skipRfDiff:
             print(
                 "NOTE: mpnn_designable_residues is ignored when skipRfDiff is True; "
@@ -2281,69 +2374,104 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
                 )
             else:
                 # Input PDB residue (chain, resseq) -> flat contig position.
-                # The trb stores the PDB-mapped contig positions in contig order:
-                #   complex_con_ref_idx0[j] = index into the input PDB residue list
-                #   complex_con_hal_idx0[j] = position in the generated sequence
-                # (fall back to the non-complex pair when the complex one is absent)
-                ref_idx_list = list(complex_con_ref_idx0)
+                # Content-based: the trb stores the PDB-mapped contig
+                # positions in contig order as two parallel lists:
+                #   complex_con_ref_pdb_idx[j] = (chain, resseq) in the input PDB
+                #   complex_con_hal_idx0[j]    = position in the generated sequence
+                # This does not assume RFDiff's and Biopython's residue lists
+                # line up positionally (they don't for multi-model PDBs, where
+                # RFDiff reads every model and Biopython only the first).
+                trb_ref_pdb = trb_data.get(
+                    "complex_con_ref_pdb_idx",
+                    trb_data.get("con_ref_pdb_idx", None),
+                )
                 hal_idx_list = list(
                     trb_data.get(
                         "complex_con_hal_idx0",
                         trb_data.get("con_hal_idx0", []),
                     )
                 )
-                ref_to_pos = dict(
-                    zip(
-                        (int(x) for x in ref_idx_list),
-                        (int(x) for x in hal_idx_list),
+                if trb_ref_pdb is not None:
+                    residue_to_pos = {
+                        (str(r[0]), int(r[1])): int(p)
+                        for r, p in zip(trb_ref_pdb, hal_idx_list)
+                    }
+                else:
+                    # older trb without content-based (chain,resseq) lists:
+                    # fall back to positional indexing
+                    ref_to_pos = dict(
+                        zip(
+                            (int(x) for x in complex_con_ref_idx0),
+                            (int(x) for x in hal_idx_list),
+                        )
                     )
-                )
-                res_to_ref_idx = {
-                    res: i for i, res in enumerate(all_residues_reference)
-                }
+                    res_to_ref_idx = {
+                        res: i for i, res in enumerate(all_residues_reference)
+                    }
 
                 def _parse_designable_spec(spec):
                     """'A12' -> [('A',12)]; 'A12-45' or 'A12-A45' -> range on
-                    chain A; 'B' -> ('CHAIN','B') (resolved vs input PDB)."""
-                    spec = str(spec)
+                    chain A; 'B' -> ('CHAIN','B') (resolved vs the contig's
+                    fixed backbone). Returns None if unparseable."""
+                    spec = str(spec).strip()
+                    if not spec:
+                        return None
                     if "-" in spec:
                         ch = spec[0]
+                        if not ch.isalpha():
+                            return None
                         parts = spec[1:].split("-")
-                        lo = int(parts[0])
-                        hi_part = parts[1]
-                        # allow both 'A12-45' and 'A12-A45'
-                        hi = int(hi_part[1:]) if hi_part[:1].isalpha() else int(hi_part)
+                        if len(parts) != 2:
+                            return None
+                        try:
+                            lo = int(parts[0])
+                            hi_part = parts[1]
+                            # allow both 'A12-45' and 'A12-A45'
+                            hi = int(hi_part[1:]) if hi_part[:1].isalpha() else int(hi_part)
+                        except ValueError:
+                            return None
                         return [(ch, i) for i in range(lo, hi + 1)]
                     if len(spec) == 1 and spec.isalpha():
                         return ("CHAIN", spec)
-                    return [(spec[0], int(spec[1:]))]
+                    try:
+                        return [(spec[0], int(spec[1:]))]
+                    except (ValueError, IndexError):
+                        return None
 
                 for spec in mpnn_designable:
                     parsed = _parse_designable_spec(spec)
+                    if parsed is None:
+                        print(
+                            f"WARNING: mpnn_designable_residues: could not "
+                            f"parse '{spec}'; ignoring."
+                        )
+                        continue
                     if isinstance(parsed, tuple) and parsed[0] == "CHAIN":
-                        targets = [
-                            r for r in all_residues_reference if r[0] == parsed[1]
-                        ]
+                        if trb_ref_pdb is not None:
+                            targets = sorted(
+                                (ch, rn)
+                                for (ch, rn) in residue_to_pos
+                                if ch == parsed[1]
+                            )
+                        else:
+                            targets = [
+                                r
+                                for r in all_residues_reference
+                                if r[0] == parsed[1]
+                            ]
                     else:
                         targets = parsed
                     for ich, resn in targets:
-                        ref_i = res_to_ref_idx.get((ich, resn))
-                        if ref_i is None:
+                        if trb_ref_pdb is not None:
+                            pos = residue_to_pos.get((ich, resn))
+                        else:
+                            ref_i = res_to_ref_idx.get((ich, resn))
+                            pos = ref_to_pos.get(ref_i) if ref_i is not None else None
+                        if pos is None:
                             print(
                                 f"WARNING: mpnn_designable_residues: {ich}{resn} "
-                                f"not found in input PDB ({ref_path}); ignoring."
-                            )
-                            continue
-                        pos = ref_to_pos.get(ref_i)
-                        if pos is None:
-                            # Residue is not part of the contig's fixed backbone
-                            # (e.g. it lies in a newly generated region) - it is
-                            # already in RFDiffusion's design set, so MPNN will
-                            # sequence it anyway.
-                            print(
-                                f"NOTE: mpnn_designable_residues: {ich}{resn} has "
-                                f"no fixed backbone (not PDB-mapped in the contig); "
-                                f"it is already in RFDiffusion's design set."
+                                f"not found in the contig's fixed backbone "
+                                f"(input PDB: {ref_path}); ignoring."
                             )
                             continue
                         # Which output chain contains this flat position, and
