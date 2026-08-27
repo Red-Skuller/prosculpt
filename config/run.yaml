@@ -14,6 +14,37 @@ prediction_model: AF3 #Colabfold, Boltz2 or AF3
 skipRfDiff: False # Whether to skip RfDiff and only redesign a few residues with ProteinMPNN and AF
 designable_residues: [A8, A9, A10, A13, A85, B, C] # Residues to be redesigned when skipRfDiff == True. Also add letters of all other chains in the PDB you wish to have in the end structure.
 
+# ---------------------------------------------------------------------------
+# Boltz2-only options: static additions to the generated boltz.yaml files.
+#
+# boltz_extras: null  # set to a dict to add ligands / RNA / DNA / constraints /
+                      # templates / affinity properties to every generated YAML.
+                      # Chain IDs: designed protein chains are labeled A, B, C...
+                      # by position in the colon-separated MPNN sequence. Extra
+                      # entries must use free letters (or omit the id to auto-assign).
+#
+# Example (uncomment and adapt):
+# boltz_extras:
+#   sequences:
+#     - ligand: {id: C, ccd: SAH}                    # CCD ligand (PDB component code)
+#     - ligand: {id: D, smiles: 'CC(=O)Oc1ccccc1C(=O)O'}  # SMILES ligand
+#     - ligand: {id: E, ccd: [EDO, GLU]}             # multi-residue ligand
+#     - rna:    {id: F, sequence: GCAUAGC}           # RNA chain (or dna:)
+#   constraints:
+#     - pocket: {binder: C, contacts: [[A, 42], [B, 10]], max_distance: 6.0}
+#     # - contact: {token1: [A, 1], token2: [C, 1], max_distance: 6.0}
+#     # - bond: {atom1: [A, 1, CA], atom2: [B, 2, N]}
+#   templates:
+#     # - cif: /path/to/template.cif
+#   properties:
+#     - affinity: {binder: C}                        # Boltz2 affinity scoring
+#   version: 1
+#
+# boltz_yaml_postprocess_script: null  # Optional path to a Python script that can
+#   # modify each generated boltz YAML after writing. The script must define:
+#   #   def postprocess_yaml(yaml_path: str, cfg: dict, model_id: str) -> None
+#   # Escape hatch for per-model or computed edits beyond boltz_extras.
+
 defaults:
   - installation
   - _self_

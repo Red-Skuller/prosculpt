@@ -151,7 +151,6 @@ def general_config_prep(cfg):
             log.info(
                 f"Chains to design (according to contig chain breaks): {cfg.chains_to_design}"
             )
-        cfg.mpnn_contig = cfg.get("mpnn_contig", None)
 
     for directory in [cfg.rfdiff_out_dir, cfg.mpnn_out_dir, cfg.af2_out_dir]:
         os.makedirs(directory, exist_ok=True)
@@ -450,6 +449,37 @@ def parse_additional_args(cfg, group):
     for k, v in (cfg.get(group, {}) or {}).items():  # or to allow for empty groups
         dodatniArgumenti += f" {k} {v}"
     return dodatniArgumenti
+
+
+def run_boltz_yaml_postprocess(cfg, yaml_path, model_id):
+    """Optionally let a user script modify a generated boltz input YAML.
+
+    Enabled via the `boltz_yaml_postprocess_script` config option (path to a
+    Python file). The script must define:
+
+        def postprocess_yaml(yaml_path: str, cfg: dict, model_id: str) -> None:
+            # read yaml_path, modify, write back
+
+    This is an escape hatch for anything the static `boltz_extras` block
+    cannot express (per-model edits, values computed at runtime, ...).
+    No-op if the option is unset. Follows the same plugin pattern as
+    `rfdiff_backbone_filters`.
+    """
+    script = cfg.get("boltz_yaml_postprocess_script", None)
+    if not script:
+        return
+    spec = importlib.util.spec_from_file_location("boltz_yaml_postprocess", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "postprocess_yaml"):
+        raise ValueError(
+            f"boltz_yaml_postprocess_script '{script}' must define "
+            f"postprocess_yaml(yaml_path, cfg, model_id)"
+        )
+    log.info(f"Running boltz yaml postprocess script {script} on {yaml_path}")
+    mod.postprocess_yaml(
+        yaml_path, OmegaConf.to_container(cfg, resolve=True), model_id
+    )
 
 
 error_messages = ["Testing if we can restart the prosculptApp(cfg)"]
@@ -882,6 +912,9 @@ def do_cycling(cfg):
                                     yaml_dir,
                                     alignment_inputs_dir,
                                 )
+                                run_boltz_yaml_postprocess(
+                                    cfg, custom_yaml_path, sequence_id
+                                )
                                 input_yaml_files.append(custom_yaml_path)
 
                     run_and_log(
@@ -996,6 +1029,9 @@ def do_cycling(cfg):
                                     mpnn_seq,
                                     yaml_dir,
                                     None,
+                                )
+                                run_boltz_yaml_postprocess(
+                                    cfg, custom_yaml_path, sequence_id
                                 )
                                 # input_yaml_files.append(custom_yaml_path)
 

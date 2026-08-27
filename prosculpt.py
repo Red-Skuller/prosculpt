@@ -13,40 +13,104 @@ from pathlib import Path
 import string
 import homooligomer_rmsd
 from Bio.Align import PairwiseAligner
+from Bio.Data import IUPACData
 import re
 import yaml
 import copy
+from omegaconf import OmegaConf
 
-def map_mpnn_contig(mpnn_contig, trb_data, chainResidOffset, skipRfDiff, con_hal_pdb_idx_complete):
-    fixed_res = {}
-    if not mpnn_contig:
-        return fixed_res
+# 3-letter residue names (uppercase, as in PDB files) of the 20 standard
+# amino acids. Used to filter protein residues out of predicted structures
+# that may also contain non-polymer chains (ligands, metal ions, water)
+# added via boltz_extras.
+STD_AA_RESNAMES = {k.upper() for k in IUPACData.protein_letters_3to1}
 
-    ref_to_hal = {}
-    if not skipRfDiff and trb_data:
-        if "complex_con_ref_pdb_idx" in trb_data:
-            ref_idx = trb_data["complex_con_ref_pdb_idx"]
-            hal_idx = trb_data["complex_con_hal_pdb_idx"]
+
+def filter_protein_residues(residues):
+    """Keep only standard amino-acid residues.
+
+    A predicted PDB that included ligands/metals in the input (see
+    `boltz_extras`) contains non-protein residues without CA atoms (a calcium
+    ion ligand is even a single atom literally named 'CA'), so we filter by
+    standard residue name instead. Protein residues keep their original
+    order, so index-based mapping (e.g. from the RFDiffusion .trb file)
+    stays aligned.
+    """
+    return [r for r in residues if r.get_resname() in STD_AA_RESNAMES]
+
+
+def _boltz_next_free_id(used_ids):
+    """Return the next free single-letter chain ID (A..Z) not in used_ids."""
+    for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        if ch not in used_ids:
+            return ch
+    raise ValueError(
+        "boltz_extras: no free single-letter chain IDs left (A-Z all in use)"
+    )
+
+
+def _merge_boltz_extras(data, cfg):
+    """Merge static additions from cfg.boltz_extras into a boltz input dict.
+
+    The config block mirrors the Boltz input schema (see boltz docs):
+
+        boltz_extras:
+          sequences:   # extra non-protein (or static protein) chains
+            - ligand: {id: C, ccd: SAH}          # or: smiles: 'CCO'
+            - ligand: {id: D, ccd: [EDO, GLU]}   # multi-residue ligand
+            - rna:    {id: E, sequence: GCAUAGC}
+            - dna:    {id: F, sequence: ATCG}
+          constraints:  # bond / pocket / contact
+            - pocket: {binder: C, contacts: [[A, 42]], max_distance: 6.0}
+          templates:    # [{cif: path} ...]
+          properties:   # [{affinity: {binder: C}}]
+          version: 1
+
+    - Entries without an `id` get the next free chain letter auto-assigned.
+    - Explicit `id`s are checked against the designed protein chain IDs
+      (A, B, C... by position in the colon-separated MPNN sequence) and
+      raise a clear error on collision.
+    - If cfg has no boltz_extras (or it is null), data is returned unchanged.
+    """
+    if cfg is None or cfg.get("boltz_extras", None) is None:
+        return data
+
+    extras = OmegaConf.to_container(cfg.boltz_extras, resolve=True)
+
+    used_ids = set()
+    for seq in data["sequences"]:
+        cid = next(iter(seq.values()))["id"]
+        used_ids.update(cid if isinstance(cid, list) else [cid])
+
+    for entry in extras.get("sequences", []) or []:
+        etype = next(iter(entry))
+        if etype not in {"protein", "dna", "rna", "ligand"}:
+            raise ValueError(
+                f"boltz_extras.sequences: invalid entry type '{etype}' "
+                f"(expected protein, dna, rna or ligand)"
+            )
+        spec = dict(entry[etype])
+        if "id" not in spec:
+            spec["id"] = _boltz_next_free_id(used_ids)
         else:
-            ref_idx = trb_data.get("con_ref_pdb_idx", [])
-            hal_idx = trb_data.get("con_hal_pdb_idx", [])
-        for (ref_chain, ref_res), (hal_chain, hal_res) in zip(ref_idx, hal_idx):
-            ref_to_hal[(ref_chain, ref_res)] = (hal_chain, hal_res)
-    else:
-        for chain, res in con_hal_pdb_idx_complete:
-            ref_to_hal[(chain, res)] = (chain, res)
+            ids = spec["id"] if isinstance(spec["id"], list) else [spec["id"]]
+            for cid in ids:
+                if cid in used_ids:
+                    raise ValueError(
+                        f"boltz_extras: chain id '{cid}' collides with an "
+                        f"already used chain id. Designed protein chains are "
+                        f"labeled A..Z by position in the colon-separated "
+                        f"MPNN sequence; pick a free letter or omit the id "
+                        f"to auto-assign."
+                    )
+        used_ids.update(ids if isinstance(spec["id"], list) else [spec["id"]])
+        data["sequences"].append({etype: spec})
 
-    contig_segments = mpnn_contig.split(",")
-    for segment in contig_segments:
-        chain = segment[0]
-        start, end = map(int, segment[1:].split("-"))
-        for res_num in range(start, end + 1):
-            original_pos = (chain, res_num)
-            if original_pos in ref_to_hal:
-                new_chain, new_res = ref_to_hal[original_pos]
-                fixed_res.setdefault(new_chain, []).append(new_res - chainResidOffset.get(new_chain, 0))
+    for key in ("constraints", "templates", "properties", "version"):
+        if extras.get(key) is not None:
+            data[key] = extras[key]
+    return data
 
-    return fixed_res
 
 def make_boltz_input_yaml(
     cfg, model_id, mpnn_sequence, output_dir, input_alignment_dir
@@ -111,6 +175,10 @@ def make_boltz_input_yaml(
                     }
                 }
             )
+
+    # Add user-specified static additions (ligands, RNA/DNA, constraints,
+    # templates, affinity properties) from the boltz_extras config block.
+    data = _merge_boltz_extras(data, cfg)
 
     with open(f"{output_dir}/{model_id}.yaml", "w") as outfile:
         yaml.dump(data, outfile, default_flow_style=False)
@@ -270,7 +338,11 @@ def calculate_RMSD_linker_len(
             ]
             selected_residues_in_designed_chains = selected_residue_data  # This will be a problem if there are fixed chains. TODO:FIX
 
-            all_af2_res = list(structure_af2.get_residues())
+            # Filter to standard AAs: predicted PDBs may contain ligand/metal
+            # chains added via boltz_extras (see filter_protein_residues).
+            all_af2_res = filter_protein_residues(
+                structure_af2.get_residues()
+            )
             all_af2_res_ca = [ind["CA"] for ind in all_af2_res]
             af2_all_fixed_res = [
                 all_af2_res[ind]["CA"] for ind in selected_residue_data
@@ -409,7 +481,9 @@ def calculate_RMSD_linker_len(
         selected_residues_in_fixed_chains = []
         selected_residues_in_designed_chains = selected_residues_data
 
-    all_af2_res = list(structure_af2.get_residues())
+    # Filter to standard AAs: predicted PDBs may contain ligand/metal
+    # chains added via boltz_extras (see filter_protein_residues).
+    all_af2_res = filter_protein_residues(structure_af2.get_residues())
     all_af2_res_ca = [ind["CA"] for ind in all_af2_res]
 
     af2_all_fixed_res = [all_af2_res[ind]["CA"] for ind in selected_residues_data]
@@ -2032,17 +2106,7 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
 
         fixed_res = dict(zip(abeceda, [[] for _ in range(breaks)]))
         print(f"DEBUG: Fixed res (according to contig chain breaks): {fixed_res}")
-        if cfg.get("mpnn_contig", None):
-            trb_input = None if skipRfDiff else trb_data
-            fixed_res = map_mpnn_contig(cfg.mpnn_contig, trb_input, chainResidOffset, skipRfDiff,
-                                        con_hal_pdb_idx_complete)
-        else:
-            for (chain, idx), (chain_from_input, idx_from_input) in zip(con_hal_idx, complex_con_ref_pdb_idx):
-                if not skipRfDiff:
-                    if trb_data["inpaint_seq"][idx - 1]:
-                        fixed_res.setdefault(chain, list()).append(idx - chainResidOffset[chain])
-                else:
-                    fixed_res.setdefault(chain, list()).append(idx)
+
         # This is only good if multiple chains due to symmetry: all of them are equal; ProteinMPNN expects fixed_res as 1-based, resetting for each chain.
         # TODO: Fix for multi-chain receptors 
 
@@ -2080,6 +2144,128 @@ def process_pdb_files(pdb_path: str, out_path: str, cfg, trb_paths=None, cycle=0
             # RfDiff outputs multiple chains if contig has /0 (chain break)
 
         print(f"Fixed res: ${fixed_res}")
+
+        # Optionally unfix residues for ProteinMPNN.
+        #
+        # By default MPNN's design set == RFDiffusion's design set: exactly the
+        # positions whose backbone was generated (inpaint_seq == False). To let
+        # RFDiffusion design a SUBSET of the residues the user wants changed,
+        # set mpnn_designable_residues (input PDB coordinates) to a list of
+        # residues whose backbones stay fixed in the contig but which MPNN
+        # should re-sequence anyway. Accepted specs: "A12" (single residue),
+        # "A12-A45" (range, same chain), "B" (whole chain).
+        mpnn_designable = cfg.get("mpnn_designable_residues", None)
+        if mpnn_designable and skipRfDiff:
+            print(
+                "NOTE: mpnn_designable_residues is ignored when skipRfDiff is True; "
+                "use designable_residues instead."
+            )
+        if not skipRfDiff and mpnn_designable:
+            if ref_path is None:
+                print(
+                    "WARNING: mpnn_designable_residues requires pdb_path (the input "
+                    "PDB the residue numbers refer to). Ignoring it."
+                )
+            else:
+                # Input PDB residue (chain, resseq) -> flat contig position.
+                # The trb stores the PDB-mapped contig positions in contig order:
+                #   complex_con_ref_idx0[j] = index into the input PDB residue list
+                #   complex_con_hal_idx0[j] = position in the generated sequence
+                # (fall back to the non-complex pair when the complex one is absent)
+                ref_idx_list = list(complex_con_ref_idx0)
+                hal_idx_list = list(
+                    trb_data.get(
+                        "complex_con_hal_idx0",
+                        trb_data.get("con_hal_idx0", []),
+                    )
+                )
+                ref_to_pos = dict(
+                    zip(
+                        (int(x) for x in ref_idx_list),
+                        (int(x) for x in hal_idx_list),
+                    )
+                )
+                res_to_ref_idx = {
+                    res: i for i, res in enumerate(all_residues_reference)
+                }
+
+                def _parse_designable_spec(spec):
+                    """'A12' -> [('A',12)]; 'A12-45' or 'A12-A45' -> range on
+                    chain A; 'B' -> ('CHAIN','B') (resolved vs input PDB)."""
+                    spec = str(spec)
+                    if "-" in spec:
+                        ch = spec[0]
+                        parts = spec[1:].split("-")
+                        lo = int(parts[0])
+                        hi_part = parts[1]
+                        # allow both 'A12-45' and 'A12-A45'
+                        hi = int(hi_part[1:]) if hi_part[:1].isalpha() else int(hi_part)
+                        return [(ch, i) for i in range(lo, hi + 1)]
+                    if len(spec) == 1 and spec.isalpha():
+                        return ("CHAIN", spec)
+                    return [(spec[0], int(spec[1:]))]
+
+                for spec in mpnn_designable:
+                    parsed = _parse_designable_spec(spec)
+                    if isinstance(parsed, tuple) and parsed[0] == "CHAIN":
+                        targets = [
+                            r for r in all_residues_reference if r[0] == parsed[1]
+                        ]
+                    else:
+                        targets = parsed
+                    for ich, resn in targets:
+                        ref_i = res_to_ref_idx.get((ich, resn))
+                        if ref_i is None:
+                            print(
+                                f"WARNING: mpnn_designable_residues: {ich}{resn} "
+                                f"not found in input PDB ({ref_path}); ignoring."
+                            )
+                            continue
+                        pos = ref_to_pos.get(ref_i)
+                        if pos is None:
+                            # Residue is not part of the contig's fixed backbone
+                            # (e.g. it lies in a newly generated region) - it is
+                            # already in RFDiffusion's design set, so MPNN will
+                            # sequence it anyway.
+                            print(
+                                f"NOTE: mpnn_designable_residues: {ich}{resn} has "
+                                f"no fixed backbone (not PDB-mapped in the contig); "
+                                f"it is already in RFDiffusion's design set."
+                            )
+                            continue
+                        # Which output chain contains this flat position, and
+                        # what is its 1-based per-chain index (MPNN convention)?
+                        ochain = None
+                        for key in abeceda:
+                            if key in chainResidOffset and pos >= chainResidOffset[key]:
+                                ochain = key
+                        if ochain is None:
+                            print(
+                                f"WARNING: mpnn_designable_residues: {ich}{resn} "
+                                f"(position {pos}) does not map to any output "
+                                f"chain; ignoring."
+                            )
+                            continue
+                        perchain_idx = pos - chainResidOffset[ochain] + 1
+                        if perchain_idx in fixed_res.get(ochain, []):
+                            fixed_res[ochain].remove(perchain_idx)
+                            print(
+                                f"mpnn_designable_residues: unfixing {ich}{resn} "
+                                f"(output {ochain}{perchain_idx}) for ProteinMPNN"
+                            )
+                        else:
+                            print(
+                                f"NOTE: {ich}{resn} (output {ochain}{perchain_idx}) "
+                                f"was not in the fixed list; nothing to unfix."
+                            )
+                        ctd = str(cfg.get("chains_to_design", None) or "")
+                        if ctd and ochain not in ctd.split():
+                            print(
+                                f"WARNING: output chain {ochain} (of {ich}{resn}) "
+                                f"is not in chains_to_design ('{ctd}'); "
+                                f"ProteinMPNN would still fix the whole chain. "
+                                f"Add {ochain} to chains_to_design."
+                            )
 
         fixpos[pdb_basename] = fixed_res
 

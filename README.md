@@ -161,6 +161,43 @@ Add parameters as required by ProteinMPNN to the `pass_to_mpnn` group in run.yam
 ## Passing additional arguments to AlphaFold
 Add parameters as required by AlphaFold to the `pass_to_af` group in run.yaml (including trailing `--`). Switches should be passed with an empty string value, like this `--templates: ""`. 
 
+## Adding ligands and other static additions to Boltz runs (Boltz2 only)
+By default, the generated `boltz.yaml` files only contain the protein sequences designed by RFDiffusion + ProteinMPNN. To include ligands, RNA/DNA, constraints, templates, or affinity properties in every generated YAML, set the `boltz_extras` option in your run config. It mirrors the [Boltz input schema](https://github.com/jwohlwend/boltz) (`sequences`, `constraints`, `templates`, `properties`, `version`).
+
+**Chain ID convention:** the designed protein chains are labeled `A`, `B`, `C`, ... by their position in the colon-separated MPNN sequence (first segment = `A`). Any extra entry must use a chain letter that the design does NOT use, or omit the `id` entirely to have one auto-assigned. Explicit IDs that collide with a designed chain raise an error before Boltz is run.
+
+```yaml
+boltz_extras:
+  sequences:
+    - ligand: {id: C, ccd: SAH}                        # CCD ligand
+    - ligand: {id: D, smiles: 'CC(=O)Oc1ccccc1C(=O)O'} # SMILES ligand
+    - ligand: {id: E, ccd: [EDO, GLU]}                 # multi-residue ligand
+    - rna:    {id: F, sequence: GCAUAGC}               # RNA (or dna:)
+  constraints:
+    - pocket: {binder: C, contacts: [[A, 42], [B, 10]], max_distance: 6.0}
+  properties:
+    - affinity: {binder: C}                            # Boltz2 affinity scoring
+```
+
+See `Examples/ligand_boltz.yaml` for a complete working example. Note that ligand chains are present in the predicted PDBs; the RMSD/plDDT scoring steps automatically ignore non-protein chains.
+
+For edits that go beyond the static block (per-model or computed values), set `boltz_yaml_postprocess_script` to a Python file defining `postprocess_yaml(yaml_path: str, cfg: dict, model_id: str) -> None`. It is called once per generated YAML after it is written.
+
+## Giving ProteinMPNN a different design set than RFDiffusion
+By default, ProteinMPNN re-sequences exactly the residues whose backbone RFDiffusion generated (the non-PDB part of the `contig`) - the two "design sets" are identical. To let RFDiffusion design a **subset** of the residues you want changed, keep the rest of the region fixed in the contig and list it in `mpnn_designable_residues` (input PDB coordinates; accepted: `A12`, `A12-A45` or `A12-45`, `B` for a whole chain):
+
+```yaml
+pdb_path: input.pdb
+# RFDiffusion only generates a new 25-mer backbone (A31-55 region)
+contig: "[A1-30/25-25/A56-100]"
+# ...but MPNN also re-sequences these fixed-backbone residues
+mpnn_designable_residues: [A20-A29, A56-A70]
+```
+
+Now RFDiff's design set (25 new residues) is a strict subset of MPNN's design set (25 + 10 + 15). Residues inside the newly generated region are always re-sequenced and need not be listed. See `Examples/redesign_subset_boltz.yaml`.
+
+The opposite direction (MPNN designs a **subset** of what RFDiffusion diffused) is the built-in partial-diffusion mode: set `partial_diffusion: True` and `contigmap.provide_seq: [ranges]` (zero-indexed over the whole flat contig sequence) to keep the original sequence of selected diffused positions - see `Examples/partial_diffusion_AF3.yaml`. With `skipRfDiff: True`, `designable_residues` defines MPNN's design set explicitly (RFDiffusion is not run).
+
 ## Examples for contigs
 Contigs are the most important input (for now, guiding potentials are another input to be explored in the future). Here are a few guidelines to ease the start of your projects.
 - Ranges starting with letters will be taken from the input.pdb

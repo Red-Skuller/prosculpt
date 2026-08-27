@@ -1,8 +1,29 @@
 import os
 from Bio.PDB import PDBParser, PDBIO, Superimposer, Structure
+from Bio.Data import IUPACData
 from scipy.spatial import distance
 import numpy as np
 import argparse
+
+# Uppercase 3-letter residue names of the 20 standard amino acids (as in PDB
+# files), used to ignore non-polymer chains (ligands, metal ions, water) that
+# may be present in Boltz-predicted structures when they were added via the
+# boltz_extras config block.
+STD_AA_RESNAMES = {k.upper() for k in IUPACData.protein_letters_3to1}
+
+
+def _std_aa_only(residues):
+    """Keep only standard amino-acid residues (protein backbone only)."""
+    return [r for r in residues if r.get_resname() in STD_AA_RESNAMES]
+
+
+def _protein_chains(structure):
+    """Chains containing at least one standard amino-acid residue."""
+    return [
+        c
+        for c in structure.get_chains()
+        if any(r.get_resname() in STD_AA_RESNAMES for r in c.get_residues())
+    ]
 
 #we want to align corresponding chains in mobile and target structures
 #to do that, we see which chain of mobile structure gives the lowest rmsd in alignment with first chain of target
@@ -13,16 +34,20 @@ import argparse
 def align_chain_A(path_to_target, path_to_mobile, parser): 
     structure_target = parser.get_structure("target", path_to_target)
     structure_mobile = parser.get_structure("mobile", path_to_mobile)
-    mobile_chains = list(structure_mobile.get_chains())
-    target_chains = list(structure_target.get_chains())
+    # Ignore non-polymer chains (ligands etc. from boltz_extras): they have no
+    # CA atoms, which would crash the Superimposer with an empty atom list.
+    mobile_chains = _protein_chains(structure_mobile)
+    target_chains = _protein_chains(structure_target)
 
-    target_chain_res = list(target_chains[0].get_residues())
+    # Only standard-AA residues are used for alignment so that non-polymer
+    # chains (ligands etc. from boltz_extras) don't break the CA lookup.
+    target_chain_res = _std_aa_only(list(target_chains[0].get_residues()))
     target_chain_res = [ind['CA'] for ind in target_chain_res] 
 
     #let's find which chain in mobile gives the smallest rmsd in alignment with chain[0] of target
     list_rmsd_chains = []
     for n in mobile_chains:
-        mobile_chain_res = list(n.get_residues())
+        mobile_chain_res = _std_aa_only(list(n.get_residues()))
         mobile_chain_res = [ind['CA'] for ind in mobile_chain_res]
 
         superimposer = Superimposer()
@@ -33,7 +58,7 @@ def align_chain_A(path_to_target, path_to_mobile, parser):
     index_min = np.argmin(list_rmsd_chains)
 
     #align chains with the best correspondence
-    mobile_chain_res = list(mobile_chains[index_min].get_residues())
+    mobile_chain_res = _std_aa_only(list(mobile_chains[index_min].get_residues()))
     mobile_chain_res = [ind['CA'] for ind in mobile_chain_res]
 
     superimposer = Superimposer()
@@ -70,12 +95,12 @@ def align_monomer(path_to_target, path_to_mobile, save_aligned,  output_pdb=None
     structure_mobile = parser.get_structure("mobile", path_to_mobile)
     
     target_chains = list(structure_target.get_chains())
-    mobile_chain_res = list(structure_mobile.get_residues())
+    mobile_chain_res = _std_aa_only(list(structure_mobile.get_residues()))
     mobile_chain_res = [ind['CA'] for ind in mobile_chain_res]
 
     list_rmsd_chains = []
     for n in target_chains:
-        target_chain_res = list(n.get_residues())
+        target_chain_res = _std_aa_only(list(n.get_residues()))
         target_chain_res = [ind['CA'] for ind in target_chain_res]
 
         superimposer = Superimposer()
@@ -88,7 +113,7 @@ def align_monomer(path_to_target, path_to_mobile, save_aligned,  output_pdb=None
     #align chains with the best correspondence (only align again so that we save the best-aligned option)
     if save_aligned==True:
         index_min = np.argmin(list_rmsd_chains)
-        target_chain_res = list(target_chains[index_min].get_residues())
+        target_chain_res = _std_aa_only(list(target_chains[index_min].get_residues()))
         target_chain_res = [ind['CA'] for ind in target_chain_res]
         superimposer = Superimposer()
         superimposer.set_atoms(target_chain_res, mobile_chain_res)
@@ -105,8 +130,11 @@ def align_oligomers(path_to_target, path_to_mobile, save_aligned, output_pdb=Non
     
     parser = PDBParser(PERMISSIVE=1)
     structure_target, structure_mobile = align_chain_A(path_to_target, path_to_mobile, parser)
-    target_chains = list(structure_target.get_chains())
-    mobile_chains = list(structure_mobile.get_chains())
+    # Ignore non-polymer chains (ligands etc.) in both structures and use
+    # these same filtered lists everywhere below so index lookups stay
+    # consistent.
+    target_chains = _protein_chains(structure_target)
+    mobile_chains = _protein_chains(structure_mobile)
 
     target_chains_com = chains_com_coords(target_chains)
     mobile_chains_com = chains_com_coords(mobile_chains)
@@ -123,11 +151,11 @@ def align_oligomers(path_to_target, path_to_mobile, save_aligned, output_pdb=Non
 
     target_res_total = list(structure_target.get_residues())
     mobile_res_total = []
-    for i in range(len(list(structure_target.get_chains()))):
-        k = list(structure_mobile.get_chains())[corresponding[i]]
+    for i in range(len(target_chains)):
+        k = mobile_chains[corresponding[i]]
         mobile_res_total += list(k.get_residues())
-    target_res_total = [ind['CA'] for ind in target_res_total]
-    mobile_res_total = [ind['CA'] for ind in mobile_res_total]
+    target_res_total = [ind['CA'] for ind in _std_aa_only(target_res_total)]
+    mobile_res_total = [ind['CA'] for ind in _std_aa_only(mobile_res_total)]
 
     superimposer = Superimposer()
     superimposer.set_atoms(target_res_total, mobile_res_total)
