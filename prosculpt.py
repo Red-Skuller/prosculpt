@@ -2960,7 +2960,7 @@ def rename_pdb_create_csv_AF3(
                 )
             )[0]
             print(
-                f"DEBUG: files in monomer folder {glob.glob(os.path.join(monomers_dirname, "monomer_" + model_name, "*"))}"
+                f"DEBUG: files in monomer folder {glob.glob(os.path.join(monomers_dirname, 'monomer_' + model_name, '*'))}"
             )
             monomer_confidences_files = glob.glob(
                 os.path.join(
