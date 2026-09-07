@@ -77,6 +77,36 @@ def _remap_boltz_ref(ref, remap):
     return [out_chain, out_resnum] + rest
 
 
+def _remap_boltz_ref_or_drop(ref, remap, valid_ids):
+    """Remap a constraint reference; return None (drop it) when it cannot be
+    remapped AND its chain is not present in the yaml.
+
+    This is _remap_boltz_ref plus dangling-reference handling: a reference to
+    a chain that is in the yaml but not in the remap (ligands, metals, static
+    extra proteins) is kept unchanged; a reference to a chain that is in
+    neither (e.g. a C2-image chain that is absent from a monomer-only yaml)
+    would make Boltz fail validation, so it is dropped with a warning.
+    """
+    if not isinstance(ref, (list, tuple)) or len(ref) < 2:
+        return ref
+    chain = ref[0]
+    try:
+        resnum_int = int(ref[1])
+    except (TypeError, ValueError):
+        return ref
+    mapped = remap(chain, resnum_int)
+    if mapped is not None:
+        out_chain, out_resnum = mapped
+        return [out_chain, out_resnum] + list(ref[2:])
+    if chain in valid_ids:
+        return list(ref)
+    print(
+        f"WARNING: boltz_extras constraint reference {ref} cannot be remapped "
+        f"and chain '{chain}' is not in the yaml; dropping it."
+    )
+    return None
+
+
 def build_boltz_ref_to_pos(cfg, trb_file):
     """Build a mapping {(input_chain, input_resseq): flat_position} for one
     RFDiffusion design, used to remap boltz_extras constraint references from
@@ -130,22 +160,532 @@ def build_boltz_ref_to_pos(cfg, trb_file):
             return None
         if not ref_idx_list or len(ref_idx_list) != len(hal_idx_list):
             return None
-        return {
+        mapping = {
             all_res[ref_i]: int(p)
             for ref_i, p in zip(ref_idx_list, hal_idx_list)
             if ref_i < len(all_res)
         }
-    if len(trb_ref_pdb) != len(hal_idx_list):
+    else:
+        # Content-based mapping (preferred): the trb's (chain, resseq) list
+        # pairs directly with the generated-position list, no PDB parsing
+        # involved.
+        mapping = {}
+        for entry, p in zip(trb_ref_pdb, hal_idx_list):
+            mapping[(str(entry[0]), int(entry[1]))] = int(p)
+
+    # C2 symmetry: the generated output is the monomer plus its strict 180-
+    # degree image, so the flat sequence is [monomer tokens, image tokens].
+    # Constraint references that use an IMAGE input chain (e.g. the B peptide
+    # when the monomer contig only contains the A peptide) are not in the trb
+    # mapping; map them onto the image chain at the SAME per-chain position
+    # (the image is an exact copy, so position p in the image chain is the
+    # C2 counterpart of position p in the monomer chain).
+    # c2_chain_pairs: [[monomer_chain, image_chain], ...] in input PDB coords.
+    try:
+        inference = cfg.get("inference", None)
+        symmetry = inference.get("symmetry", None) if inference is not None else None
+    except AttributeError:
+        symmetry = None
+    if symmetry == "c2":
+        # monomer flat length = full contig length (incl. new linker tokens)
+        try:
+            L_mono = len(trb_data["inpaint_seq"])
+        except (KeyError, TypeError):
+            L_mono = len(hal_idx_list)
+        pairs = cfg.get("c2_chain_pairs", None)
+        if pairs is None:
+            print(
+                "WARNING: inference.symmetry is c2 but c2_chain_pairs is not "
+                "set; boltz_extras constraint references to C2-image input "
+                "chains will not be remapped."
+            )
+        else:
+            pairs = OmegaConf.to_container(pairs, resolve=True)
+            for mon, img in pairs:
+                for (ch, rs), p in list(mapping.items()):
+                    if ch == str(mon):
+                        mapping[(str(img), rs)] = L_mono + p
+    return mapping
+
+
+def build_boltz_full_complex(cfg, trb_data, mpnn_sequence, rfdiff_pdb):
+    """Build the Boltz input chains for `boltz_full_complex` mode: the full
+    input PDB chains with the designed (RFDiff/MPNN) segments spliced in at
+    the contig positions, so Boltz predicts the whole complex (e.g. a full
+    tetramer) while RFDiff/MPNN only ran on a trimmed contig.
+
+    For each contig chain k, with host input chain X (the input chain with
+    the most contig-mapped residues in k):
+      - if k contains NEW positions (a fused design, e.g. linker + peptide
+        inserted into a subunit):
+            boltz chain = [native prefix of X before X's first anchor in k,
+                           only if the design sequence starts with an X
+                           residue]
+                        + [the design sequence of k, exactly as MPNN
+                           produced it, including new insertions and
+                           cross-chain segments]
+                        + [native suffix of X after X's last anchor in k,
+                           only if the design sequence ends with an X
+                           residue]
+        Native residues that the contig skipped BETWEEN two anchors (e.g. a
+        loop that the short designed linkers jump over) stay excluded: the
+        designed linkers cannot physically span them.
+      - if k has no new positions (pure fixed context, e.g. a whole subunit
+        or interface windows of one): boltz chain = X's FULL native sequence
+        (all residues of X present in the input PDB).
+    Input chains not referenced by the contig at all are appended as full
+    native chains (alphabetical chain order) after the contig chains.
+
+    mpnn_sequence: the colon-separated designed-chains sequence (MPNN fasta
+    line). rfdiff_pdb: the (re-chained) RFDiff output PDB, used to map
+    design flat positions onto the fasta segments.
+
+    Returns a dict
+        chains:       [{"letter", "sequence", "host", "contig_chain"}, ...]
+        res_to_token: {(input_chain, resseq): (letter, 1-based position)}
+        flat_to_token: {design flat pos: 0-based protein token index}
+        new_tokens:   [token indices of the new (inpaint==False) positions]
+    or None when it cannot be built (callers should fail the run).
+    """
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    inpaint_seq = list(trb_data.get("inpaint_seq", []))
+    n_flat = len(inpaint_seq)
+    if n_flat == 0:
+        print("WARNING: boltz_full_complex: empty inpaint_seq in trb")
+        return None
+
+    # Input PDB: standard-AA residues per chain, in native (resseq) order.
+    try:
+        structure = parse_pdb_structure(cfg["pdb_path"])
+    except Exception as e:
+        print(f"WARNING: boltz_full_complex: could not parse input PDB: {e}")
+        return None
+    t2o = {k.upper(): v for k, v in IUPACData.protein_letters_3to1.items()}
+    input_chains = {}  # chain letter -> [(resseq, aa1)] in resseq order
+    for ch in structure.get_chains():
+        cid = ch.get_id()
+        entries = []
+        for res in ch.get_residues():
+            rn = res.get_resname().upper()
+            if rn in STD_AA_RESNAMES and any(
+                a.get_name() == "CA" for a in res.get_atoms()
+            ):
+                entries.append((res.get_id()[1], rn))  # 3-letter, converted below
+        if entries:
+            entries = [(rs, t2o.get(rn, "X")) for rs, rn in entries]
+            input_chains.setdefault(cid, []).extend(entries)
+    for cid in input_chains:
+        # de-duplicate (resseq) - multi-model PDBs can repeat chains across
+        # models - and sort by resseq
+        by_resseq = {}
+        for rs, aa in input_chains[cid]:
+            by_resseq.setdefault(rs, aa)
+        input_chains[cid] = sorted(by_resseq.items())
+
+    # Design flat position -> input (chain, resseq), content-based from the trb
+    ref_pdb = trb_data.get(
+        "complex_con_ref_pdb_idx", trb_data.get("con_ref_pdb_idx", None)
+    )
+    hal_idx = list(
+        trb_data.get("complex_con_hal_idx0", trb_data.get("con_hal_idx0", []))
+    )
+    flat_to_input = {}
+    if ref_pdb is not None and len(ref_pdb) == len(hal_idx):
+        for res, pos in zip(ref_pdb, hal_idx):
+            flat_to_input[int(pos)] = (str(res[0]), int(res[1]))
+    else:
+        # older trb: fall back to positional indexing into the input PDB
+        try:
+            all_res, _ = get_all_residues(cfg["pdb_path"])
+            ref_idx = list(
+                trb_data.get(
+                    "complex_con_ref_idx0", trb_data.get("con_ref_idx0", [])
+                )
+            )
+            for ri, pos in zip(ref_idx, hal_idx):
+                if ri < len(all_res):
+                    flat_to_input[int(pos)] = all_res[ri]
+        except Exception as e:
+            print(f"WARNING: boltz_full_complex: no residue mapping: {e}")
+            return None
+
+    # Contig -> per-chain flat ranges. The contig string gives the ORDER of
+    # segments (PDB ranges and new/generated segments) and the chain breaks;
+    # the actual lengths of the segments come from the trb itself, because
+    # RFDiff's numeric segment syntax (e.g. 1-5) does not always equal the
+    # number of generated positions in the design (observed: 1-5 produced
+    # 5, 3 or 4 positions depending on position). We walk the design flat
+    # sequence token by token.
+    contig = trb_data["config"]["contigmap"]["contigs"][0]
+    body = contig.strip().strip("[]")
+    tokens = []  # ("pdb", cid, lo, hi) | ("new",) | ("break",)
+    for part in body.split(" "):
+        for rng in part.split("/"):
+            rng = rng.strip()
+            if not rng:
+                continue
+            if rng == "0":  # chain separator
+                tokens.append(("break",))
+            elif rng[:1].isalpha():  # PDB range, e.g. C219-692
+                lo_s, hi_s = rng.split("-")
+                tokens.append(("pdb", lo_s[0], int(lo_s[1:]), int(hi_s)))
+            else:  # generated segment, e.g. 1-5
+                tokens.append(("new",))
+
+    pos = 0
+    chain_bounds = [(0, None)]  # (b0, b1) per contig chain; closed at breaks
+    for tok in tokens:
+        if tok[0] == "break":
+            chain_bounds[-1] = (chain_bounds[-1][0], pos)
+            chain_bounds.append((pos, None))
+            continue
+        if tok[0] == "new":
+            count = 0
+            while pos < n_flat and not inpaint_seq[pos]:
+                count += 1
+                pos += 1
+            if count == 0:
+                print(
+                    f"WARNING: boltz_full_complex: expected a generated "
+                    f"segment at flat position {pos}, found none"
+                )
+                return None
+        else:  # pdb
+            _, cid, lo, hi = tok
+            count = 0
+            last_rs = None
+            while pos < n_flat and inpaint_seq[pos]:
+                mapped = flat_to_input.get(pos)
+                if (
+                    mapped is not None
+                    and mapped[0] == cid
+                    and lo <= mapped[1] <= hi
+                    and (last_rs is None or mapped[1] == last_rs + 1)
+                ):
+                    count += 1
+                    last_rs = mapped[1]
+                    pos += 1
+                else:
+                    break
+            if count == 0:
+                print(
+                    f"WARNING: boltz_full_complex: contig range {cid}{lo}-{hi} "
+                    f"matches no design positions at flat {pos}"
+                )
+                return None
+    if chain_bounds and chain_bounds[-1][1] is None:
+        chain_bounds[-1] = (chain_bounds[-1][0], pos)
+    if pos != n_flat:
+        print(
+            f"WARNING: boltz_full_complex: contig walk consumed {pos} of "
+            f"{n_flat} design positions; giving up"
+        )
+        return None
+    chain_bounds = [(a, b) for a, b in chain_bounds if a < b]
+    if not chain_bounds:
+        print("WARNING: boltz_full_complex: no contig chains found")
+        return None
+
+    # Design AA at each flat position (from the MPNN fasta where the chain is
+    # designed; native AA for fixed residues of non-designed chains).
+    try:
+        rechain_offsets, _ = getChainResidOffsets(rfdiff_pdb, None)
+    except Exception as e:
+        print(f"WARNING: boltz_full_complex: could not read RFDiff PDB: {e}")
+        return None
+    ctd = cfg.get("chains_to_design", None)
+    if ctd:
+        design_letters = sorted(str(ctd).split())
+    else:
+        design_letters = list(letters[:len(chain_bounds)])
+    segments = [s for s in mpnn_sequence.split(":")]
+    if len(segments) != len(design_letters):
+        print(
+            f"WARNING: boltz_full_complex: MPNN sequence has "
+            f"{len(segments)} chains, expected {len(design_letters)} "
+            f"(chains_to_design)"
+        )
+        return None
+
+    def design_aa(f):
+        for c in rechain_offsets:
+            o = rechain_offsets[c]
+            if f >= o:
+                end = n_flat
+                # find the end of this re-chained chain
+                for c2 in rechain_offsets:
+                    if rechain_offsets[c2] > o and rechain_offsets[c2] < end:
+                        end = rechain_offsets[c2]
+                if o <= f < end:
+                    if c in design_letters:
+                        seg = segments[design_letters.index(c)]
+                        if f - o < len(seg):
+                            return seg[f - o]
+                        return None
+                    else:
+                        mapped = flat_to_input.get(f)
+                        if mapped is not None:
+                            for rs, aa in input_chains.get(mapped[0], []):
+                                if rs == mapped[1]:
+                                    return aa
+                        return None
+        return None
+
+    design_aa_by_flat = {}
+    for f in range(n_flat):
+        aa = design_aa(f)
+        if aa is None:
+            print(
+                f"WARNING: boltz_full_complex: no design amino acid for flat "
+                f"position {f} (not in the MPNN sequence?)"
+            )
+            return None
+        design_aa_by_flat[f] = aa
+
+    # Build the boltz chains
+    chains = []
+    res_to_token = {}
+    flat_to_token = {}
+    new_tokens = []
+    referenced_input_chains = set(flat_to_input.values())
+
+    for k, (b0, b1) in enumerate(chain_bounds):
+        positions = range(b0, b1)
+        has_new = any(not inpaint_seq[f] for f in positions)
+        # host = input chain with the most mapped positions in this contig chain
+        counts = {}
+        for f in positions:
+            mapped = flat_to_input.get(f)
+            if mapped is not None:
+                counts[mapped[0]] = counts.get(mapped[0], 0) + 1
+        if not counts:
+            print(
+                f"WARNING: boltz_full_complex: contig chain {k} maps no input "
+                f"residues (all-new chain); skipping it in the full complex"
+            )
+            continue
+        host = max(counts, key=counts.get)
+        design_seq = [design_aa_by_flat[f] for f in positions]
+        prefix, suffix = [], []
+        if has_new:
+            anchors = sorted(
+                r for f in positions
+                if (m := flat_to_input.get(f)) is not None and m[0] == host
+                for r in [m[1]]
+            )
+            native = input_chains.get(host, [])
+            if design_seq and flat_to_input.get(b0) is not None and \
+                    flat_to_input[b0][0] == host:
+                prefix = [aa for rs, aa in native if rs < min(anchors)]
+            if design_seq and flat_to_input.get(b1 - 1) is not None and \
+                    flat_to_input[b1 - 1][0] == host:
+                suffix = [aa for rs, aa in native if rs > max(anchors)]
+            seq = prefix + design_seq + suffix
+        else:
+            # pure fixed context: the full native host chain
+            seq = [aa for _, aa in input_chains.get(host, [])]
+        letter = letters[len(chains)]
+        chains.append(
+            {
+                "letter": letter,
+                "sequence": "".join(seq),
+                "host": host,
+                "contig_chain": k,
+            }
+        )
+        base = len(prefix)
+        chain_offset = sum(len(c["sequence"]) for c in chains[:-1])
+        for i, f in enumerate(positions):
+            token = base + i  # 0-based within this chain
+            flat_to_token[f] = token + chain_offset
+            if not inpaint_seq[f]:
+                new_tokens.append(flat_to_token[f])
+            mapped = flat_to_input.get(f)
+            if mapped is not None:
+                key = (mapped[0], mapped[1])
+                if key in res_to_token:
+                    print(
+                        f"NOTE: boltz_full_complex: input residue {key} appears "
+                        f"in the contig more than once; the first occurrence is "
+                        f"used for constraint remapping"
+                    )
+                else:
+                    res_to_token[key] = (letter, token + 1)
+        if not has_new:
+            for i, (rs, _) in enumerate(input_chains.get(host, [])):
+                key = (host, rs)
+                if key not in res_to_token:
+                    res_to_token[key] = (letter, i + 1)
+        else:
+            # native prefix/suffix residues
+            for i, (rs, _) in enumerate(native if has_new else []):
+                key = (host, rs)
+                if key not in res_to_token:
+                    if prefix and rs < min(anchors):
+                        res_to_token[key] = (letter, i + 1)
+                    elif suffix and rs > max(anchors):
+                        res_to_token[key] = (
+                            letter,
+                            len(prefix) + len(design_seq) + (i - (len(native) - len(suffix))) + 1,
+                        )
+
+    # input chains not referenced by the contig: full native chains
+    for cid in sorted(set(input_chains) - {c for c, _ in referenced_input_chains}):
+        letter = letters[len(chains)]
+        seq = "".join(aa for _, aa in input_chains[cid])
+        chains.append({"letter": letter, "sequence": seq, "host": cid, "contig_chain": None})
+        offset = sum(len(c["sequence"]) for c in chains[:-1])
+        for i, (rs, _) in enumerate(input_chains[cid]):
+            key = (cid, rs)
+            if key not in res_to_token:
+                res_to_token[key] = (letter, i + 1)
+
+    if len(chains) > 26:
+        print("WARNING: boltz_full_complex: more than 26 chains; not supported")
         return None
     return {
-        (str(r[0]), int(r[1])): int(p) for r, p in zip(trb_ref_pdb, hal_idx_list)
+        "chains": chains,
+        "res_to_token": res_to_token,
+        "flat_to_token": flat_to_token,
+        "new_tokens": new_tokens,
     }
+
+
+def _parse_residue_ranges(residues):
+    """Parse a residue selection into a set of resseq ints.
+
+    Accepts '219-736', '219', a list of such strings, or an int.
+    """
+    if isinstance(residues, int):
+        return {residues}
+    if isinstance(residues, str):
+        residues = [residues]
+    out = set()
+    for part in residues:
+        part = str(part).strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            out.update(range(int(lo), int(hi) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def _seqres_chains(pdb_path):
+    """Parse SEQRES records -> {chain_id: [3-letter residue names]}.
+
+    Biopython's PDBParser discards SEQRES lines, so read them directly.
+    Format: chain id in column 12 (1-based), a residue count, then three-letter
+    names (up to ~13 per line; continuation lines repeat the chain id). Names
+    are whitespace-split, which copes with both the standard two-space groups
+    and single-spaced writers (e.g. ChimeraX exports). Repeated identical
+    header blocks (e.g. from concatenated input files) are not double-counted.
+    """
+    seqres = {}
+    with open(pdb_path) as f:
+        for line in f:
+            if line[:6] != "SEQRES":
+                continue
+            ch = line[11:12].strip()
+            if not ch:
+                continue
+            m = re.match(r"^SEQRES\s+\d+\s+\S?\s+(\d+)\s+(.*)$", line)
+            names = m.group(2).split() if m else []
+            names = [n for n in names if len(n) >= 2]
+            if not names:
+                continue
+            existing = seqres.get(ch)
+            if existing is None:
+                seqres[ch] = names
+            elif names == existing[: len(names)]:
+                continue  # duplicate block (concatenated file headers)
+            else:
+                existing.extend(names)
+    return seqres
+
+
+def _protein_sequence_from_pdb(pdb_path, chain_id, residues=None):
+    """Extract the one-letter sequence of one chain from a PDB file.
+
+    Used for boltz_extras `protein` entries that reference the input PDB by
+    chain id (`pdb_chain`) instead of spelling out the sequence. Modified
+    amino acids (ATOM records with non-standard names) map to 'X'; non-polymer
+    residues that Biopython merges into the chain (HETATM ligands, metals,
+    water - e.g. a CU ion on a protein chain id) are skipped. `residues`
+    optionally selects a subset, e.g. "693-720" or ["219-692", "721-736"];
+    default is the whole chain.
+
+    Residues without coordinates (e.g. a PDB trimmed in ChimeraX that keeps
+    the full sequence) are taken from the chain's SEQRES record when present;
+    for a whole-chain request the full SEQRES sequence is returned. The
+    SEQRES numbering is anchored at the chain's first coordinated residue
+    (or 1 if the chain has no coordinates at all).
+    """
+    structure = parse_pdb_structure(pdb_path)
+    wanted = _parse_residue_ranges(residues) if residues is not None else None
+    three2one = {k.upper(): v for k, v in IUPACData.protein_letters_3to1.items()}
+    atom_seq = {}  # resseq -> one-letter (residue has coordinates)
+    found_chain = False
+    for chain in structure.get_chains():
+        if chain.get_id() != chain_id:
+            continue
+        found_chain = True
+        for res in chain.get_residues():
+            hetflag, resseq, _icode = res.get_id()
+            resname = res.get_resname().upper()
+            if resname in three2one:
+                atom_seq[resseq] = three2one[resname]
+            elif hetflag == " ":
+                atom_seq[resseq] = "X"  # modified amino acid (polymer residue)
+            # else: non-polymer HETATM residue (ligand/metal/water) - skip
+    # SEQRES fallback for positions without coordinates
+    seqres_map = {}
+    seqres_names = _seqres_chains(pdb_path).get(chain_id)
+    if not found_chain and seqres_names is None:
+        raise ValueError(
+            f"boltz_extras: chain '{chain_id}' not found in input PDB "
+            f"({pdb_path})"
+        )
+    if seqres_names:
+        first = min(atom_seq) if atom_seq else 1
+        seqres_map = {first + i: n for i, n in enumerate(seqres_names)}
+    if wanted is None:
+        wanted = set(atom_seq) | set(seqres_map)
+    if not wanted:
+        raise ValueError(
+            f"boltz_extras: the residue selection '{residues}' matched no "
+            f"residues of chain '{chain_id}' in {pdb_path}"
+        )
+    seq_parts = []
+    missing = []
+    for resseq in sorted(wanted):
+        if resseq in atom_seq:
+            seq_parts.append(atom_seq[resseq])
+        elif resseq in seqres_map:
+            seq_parts.append(three2one.get(seqres_map[resseq].upper(), "X"))
+        else:
+            missing.append(resseq)
+    if missing:
+        shown = ", ".join(map(str, missing[:8]))
+        if len(missing) > 8:
+            shown += f" ... ({len(missing)} total)"
+        raise ValueError(
+            f"boltz_extras: chain '{chain_id}' of {pdb_path} has neither "
+            f"coordinates nor a SEQRES record for residues: {shown}"
+        )
+    return "".join(seq_parts)
+
+
+def seqres_has_chain(pdb_path, chain_id):
+    """True if the PDB has a SEQRES record for the chain (no coordinates needed)."""
+    return chain_id in _seqres_chains(pdb_path)
 
 
 def _merge_boltz_extras(data, cfg, remap=None):
     """Merge static additions from cfg.boltz_extras into a boltz input dict.
 
-    The config block mirrors the Boltz input schema (see boltz docs):
+    The config block mirrors the Boltz input schema (see boltz docs), plus
+    two prosculpt conveniences:
 
         boltz_extras:
           sequences:   # extra non-protein (or static protein) chains
@@ -153,9 +693,22 @@ def _merge_boltz_extras(data, cfg, remap=None):
             - ligand: {id: D, ccd: [EDO, GLU]}   # multi-residue ligand
             - rna:    {id: E, sequence: GCAUAGC}
             - dna:    {id: F, sequence: ATCG}
+            # static protein: give the sequence explicitly ...
+            - protein: {id: G, sequence: MKTAYIA...}
+            # ... or take it from a chain of the input PDB (pdb_path),
+            # optionally with a residue selection. If the input PDB was
+            # trimmed (e.g. in ChimeraX), point 'pdb_file' at the FULL,
+            # untrimmed structure instead:
+            - protein: {id: G, pdb_chain: C, residues: "693-720"}
+            - protein: {id: H, pdb_chain: C, pdb_file: /path/to/full.pdb}
           constraints:  # bond / pocket / contact
             - pocket: {binder: C, contacts: [[A, 42]], max_distance: 6.0}
-          templates:    # [{cif: path} ...]
+          templates:    # Boltz templates anchoring the prediction to a structure
+            - cif: /path/to/template.cif           # or: pdb: /path/to/template.pdb
+            # prosculpt convenience: use the input PDB as the template:
+            - input_pdb: true
+              chain_id: [G, H]        # optional: model chain ids to seed
+              template_id: [C, D]     # optional: template chain ids (paired 1:1)
           properties:   # [{affinity: {binder: C}}]
           version: 1
 
@@ -197,49 +750,221 @@ def _merge_boltz_extras(data, cfg, remap=None):
                         f"to auto-assign."
                     )
         used_ids.update(ids if isinstance(spec["id"], list) else [spec["id"]])
+        if etype == "protein" and "pdb_chain" in spec:
+            if "sequence" in spec:
+                raise ValueError(
+                    "boltz_extras: protein entry has both 'sequence' and "
+                    "'pdb_chain'; use one or the other."
+                )
+            pdb_path = spec.pop("pdb_file", None) or cfg.get("pdb_path", None)
+            if pdb_path is None:
+                raise ValueError(
+                    "boltz_extras: a protein entry with 'pdb_chain' requires "
+                    "pdb_path (or an explicit 'pdb_file') - the PDB the chain "
+                    "is taken from."
+                )
+            spec["sequence"] = _protein_sequence_from_pdb(
+                pdb_path, spec.pop("pdb_chain"), spec.pop("residues", None)
+            )
         data["sequences"].append({etype: spec})
+
+    # All chain ids present in this yaml (designed + extra chains). Used to
+    # tell "static reference to a known chain" (keep) from "reference to a
+    # chain that is not in this yaml" (drop) during constraint remapping.
+    valid_ids = set()
+    for seq in data["sequences"]:
+        cid = next(iter(seq.values()))["id"]
+        valid_ids.update(cid if isinstance(cid, list) else [cid])
+
+    # prosculpt convenience: templates may reference the input PDB directly
+    if extras.get("templates") is not None:
+        resolved_templates = []
+        for t in extras["templates"]:
+            t = dict(t)
+            if t.pop("input_pdb", False):
+                pdb_path = cfg.get("pdb_path", None)
+                if pdb_path is None:
+                    raise ValueError(
+                        "boltz_extras: a template with 'input_pdb: true' "
+                        "requires pdb_path (the input PDB)."
+                    )
+                if "cif" in t or "pdb" in t:
+                    raise ValueError(
+                        "boltz_extras: template entry has both 'input_pdb' "
+                        "and an explicit 'cif'/'pdb' path."
+                    )
+                t["pdb"] = pdb_path
+            # Filter chain_id/template_id pairs down to chains that exist in
+            # this yaml (needed for monomer-only yamls in symmetry mode, where
+            # the C2-image chains are absent; Boltz requires every chain_id to
+            # be an input protein chain).
+            cids = t.get("chain_id", None)
+            tids = t.get("template_id", None)
+            if cids is not None and tids is not None:
+                keep_c, keep_t = [], []
+                for cid, tid in zip(cids, tids):
+                    if cid in valid_ids:
+                        keep_c.append(cid)
+                        keep_t.append(tid)
+                    else:
+                        print(
+                            f"WARNING: template chain_id '{cid}' is not a "
+                            f"chain of this yaml; dropping template pair "
+                            f"({cid} -> {tid})."
+                        )
+                if keep_c:
+                    t["chain_id"] = keep_c
+                    t["template_id"] = keep_t
+                else:
+                    del t["chain_id"]
+                    del t["template_id"]
+            resolved_templates.append(t)
+        extras["templates"] = resolved_templates
 
     # Remap chain/residue references in constraints from input PDB coordinates
     # to the generated (designed) sequence coordinates, so that contacts stay
     # attached to the right residues even when the contig changes lengths or
-    # re-maps chains. Static references (ligand/metal chain ids) are left as-is.
+    # re-maps chains. Static references (ligand/metal chain ids) are left
+    # as-is; references to chains that are neither remappable nor present in
+    # the yaml are dropped (they would fail Boltz input validation).
     if remap is not None:
+        kept_constraints = []
         for c in extras.get("constraints", []) or []:
+            dropped = False
             if "pocket" in c and "contacts" in c["pocket"]:
-                c["pocket"]["contacts"] = [
-                    _remap_boltz_ref(r, remap) for r in c["pocket"]["contacts"]
+                contacts = [
+                    _remap_boltz_ref_or_drop(r, remap, valid_ids)
+                    for r in c["pocket"]["contacts"]
                 ]
-            if "contact" in c:
+                contacts = [r for r in contacts if r is not None]
+                if not contacts:
+                    dropped = True  # no usable contacts left
+                c["pocket"]["contacts"] = contacts
+            if not dropped and "contact" in c:
                 for tok in ("token1", "token2"):
                     if tok in c["contact"]:
-                        c["contact"][tok] = _remap_boltz_ref(c["contact"][tok], remap)
-            if "bond" in c:
+                        new_tok = _remap_boltz_ref_or_drop(
+                            c["contact"][tok], remap, valid_ids
+                        )
+                        if new_tok is None:
+                            dropped = True
+                            break
+                        c["contact"][tok] = new_tok
+            if not dropped and "bond" in c:
                 for atom in ("atom1", "atom2"):
                     if atom in c["bond"]:
-                        c["bond"][atom] = _remap_boltz_ref(c["bond"][atom], remap)
+                        new_atom = _remap_boltz_ref_or_drop(
+                            c["bond"][atom], remap, valid_ids
+                        )
+                        if new_atom is None:
+                            dropped = True
+                            break
+                        c["bond"][atom] = new_atom
+            if dropped:
+                print(
+                    f"WARNING: dropping boltz_extras constraint with no valid "
+                    f"references: {c}"
+                )
+            else:
+                kept_constraints.append(c)
+        extras["constraints"] = kept_constraints
 
     for key in ("constraints", "templates", "properties", "version"):
-        if extras.get(key) is not None:
-            data[key] = extras[key]
+        value = extras.get(key, None)
+        if value is not None and value != []:
+            data[key] = value
     return data
 
 
+def _realign_extra_protein_msas(data, n_design_seqs, model_id, alignment_dir):
+    """Re-project boltz_extras protein MSAs onto their chain sequences.
+
+    Extra static proteins (e.g. other native subunits) normally reference a
+    raw input a3m file that prosculpt does not re-project; such files carry
+    lowercase insertions (ragged lines) and occasionally X. Every a3m file
+    written into a generated boltz.yaml is therefore re-projected through
+    recalculate_a3m, which guarantees a rectangular (query-width), X-free
+    file whose query line equals the chain sequence.
+
+    Boltz requires that all proteins with the same sequence share one MSA
+    file, so a sequence already present on another chain of the yaml (a
+    designed chain or another extra) keeps that chain's MSA path instead of
+    getting a new file.
+    """
+    seq_to_msa = {}
+    for seq in data["sequences"]:
+        if next(iter(seq)) != "protein":
+            continue
+        p = seq["protein"]
+        if p.get("msa") not in (None, "empty"):
+            seq_to_msa.setdefault(p["sequence"], p["msa"])
+
+    for seq in data["sequences"][n_design_seqs:]:
+        if next(iter(seq)) != "protein":
+            continue
+        p = seq["protein"]
+        msa = p.get("msa", None)
+        if not msa or msa == "empty" or "://" in str(msa):
+            continue
+        cid = str(p.get("id"))
+        # identical sequence on another chain: Boltz requires ONE shared MSA
+        if seq_to_msa.get(p["sequence"]) not in (None, p["msa"]):
+            shared = seq_to_msa[p["sequence"]]
+            print(
+                f"boltz_extras chain {cid}: sequence identical to another "
+                f"chain of this yaml; sharing its MSA {shared}"
+            )
+            p["msa"] = shared
+            continue
+        out_path = os.path.join(alignment_dir, f"{model_id}_extras_{cid}.a3m")
+        try:
+            recalculate_a3m(os.path.expanduser(str(msa)), p["sequence"], out_path)
+        except Exception as e:
+            print(
+                f"WARNING: could not re-align boltz_extras MSA {msa} for "
+                f"chain {cid} ({e}); keeping the original path."
+            )
+            continue
+        print(f"boltz_extras chain {cid}: re-aligned MSA {msa} -> {out_path}")
+        seq_to_msa[p["sequence"]] = out_path
+        p["msa"] = out_path
+
+
 def make_boltz_input_yaml(
-    cfg, model_id, mpnn_sequence, output_dir, input_alignment_dir, ref_to_pos=None
+    cfg,
+    model_id,
+    mpnn_sequence,
+    output_dir,
+    input_alignment_dir,
+    ref_to_pos=None,
+    full_complex=None,
 ):
     chain_ids = []
     sequences = []
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    # Split multi-chain sequences by colon
-    print(
-        f"splitting mpnn sequence {mpnn_sequence} by colon for Boltz yaml generation..."
-    )
-    split_chains = mpnn_sequence.split(":")
-    for i, chain_seq in enumerate(split_chains):
-        chain_id = f"{letters[i]}"
-        chain_ids.append(chain_id)
-        print(f"Chain ID: {chain_id}, Sequence: {chain_seq}")
-        sequences.append(chain_seq)
+    if full_complex is not None:
+        # boltz_full_complex mode: the Boltz protein chains are the full input
+        # PDB chains with the designed (RFDiff/MPNN) segments spliced in, not
+        # the bare MPNN design chains (see build_boltz_full_complex).
+        for c in full_complex["chains"]:
+            chain_ids.append(c["letter"])
+            sequences.append(c["sequence"])
+            print(
+                f"boltz_full_complex chain {c['letter']} (host {c['host']}): "
+                f"{len(c['sequence'])} residues"
+            )
+        split_chains = list(sequences)
+    else:
+        # Split multi-chain sequences by colon
+        print(
+            f"splitting mpnn sequence {mpnn_sequence} by colon for Boltz yaml generation..."
+        )
+        split_chains = mpnn_sequence.split(":")
+        for i, chain_seq in enumerate(split_chains):
+            chain_id = f"{letters[i]}"
+            chain_ids.append(chain_id)
+            print(f"Chain ID: {chain_id}, Sequence: {chain_seq}")
+            sequences.append(chain_seq)
 
     # Make boltz yaml
     data = dict(sequences=dict())
@@ -288,12 +1013,17 @@ def make_boltz_input_yaml(
                 }
             )
 
-    # Build flat-position -> (designed chain id, 1-based residue number) using
-    # the SAME chain order and alphabetic cleaning as the sequences written
-    # above. This is the target coordinate system for remapping boltz_extras
-    # constraint references (which the user writes in input PDB coordinates).
+    # Build the boltz_extras constraint remap: input-PDB (chain, resseq)
+    # references -> (Boltz chain id, 1-based residue number) in the chains
+    # written above (see _remap_boltz_ref).
     remap = None
-    if ref_to_pos:
+    if full_complex is not None:
+        res_to_token = full_complex["res_to_token"]
+
+        def remap(chain, resnum):
+            return res_to_token.get((str(chain), int(resnum)))
+
+    elif ref_to_pos:
         pos_to_chain_res = {}
         flat = 0
         for i, chain_seq in enumerate(split_chains):
@@ -312,10 +1042,40 @@ def make_boltz_input_yaml(
     # templates, affinity properties) from the boltz_extras config block.
     # Constraint chain/residue references are remapped from input PDB
     # coordinates to the newly formed chains (handles length changes).
+    n_design_seqs = len(data["sequences"])
     data = _merge_boltz_extras(data, cfg, remap=remap)
+
+    if cfg.use_a3m and input_alignment_dir is not None:
+        _realign_extra_protein_msas(
+            data, n_design_seqs, model_id, input_alignment_dir
+        )
 
     with open(f"{output_dir}/{model_id}.yaml", "w") as outfile:
         yaml.dump(data, outfile, default_flow_style=False)
+
+    if full_complex is not None:
+        # Sidecar for the scoring stage: maps design flat positions onto the
+        # (longer, spliced) Boltz protein tokens, so plDDT/RMSD can be
+        # evaluated on the designed region only.
+        with open(f"{output_dir}/{model_id}.full_complex.json", "w") as f:
+            json.dump(
+                {
+                    "flat_to_token": {
+                        str(k): v
+                        for k, v in full_complex["flat_to_token"].items()
+                    },
+                    "new_tokens": full_complex["new_tokens"],
+                    "chains": [
+                        {
+                            "letter": c["letter"],
+                            "host": c["host"],
+                            "length": len(c["sequence"]),
+                        }
+                        for c in full_complex["chains"]
+                    ],
+                },
+                f,
+            )
     return f"{output_dir}/{model_id}.yaml"
 
 
@@ -436,7 +1196,8 @@ def masked_positions(seq1, seq2, min_block=3):
 
 
 def calculate_RMSD_linker_len(
-    cfg, trb_path, af2_pdb, starting_pdb, rfdiff_pdb_path, symmetry, model_monomer
+    cfg, trb_path, af2_pdb, starting_pdb, rfdiff_pdb_path, symmetry, model_monomer,
+    flat_to_token=None,
 ):
     # First calculate RMSD between input protein and AF2 generated protein
     # Second calcualte number of total generated AA by RFDIFF
@@ -618,18 +1379,84 @@ def calculate_RMSD_linker_len(
     # Filter to standard AAs: predicted PDBs may contain ligand/metal
     # chains added via boltz_extras (see filter_protein_residues).
     all_af2_res = filter_protein_residues(structure_af2.get_residues())
-    all_af2_res_ca = [ind["CA"] for ind in all_af2_res]
+    if (
+        not flat_to_token
+        and len(all_af2_res) < len(trb_dict["inpaint_seq"])
+    ):
+        # Bare-chain mode: the predicted PDB should contain exactly the
+        # designed (MPNN fasta) chains, in RFDiff output chain order, so its
+        # residue indices equal the trb flat positions. If rechain produced
+        # more chains than chains_to_design covers, the extra (always
+        # trailing) chain(s) never reached the prediction input, so the
+        # predicted PDB is a flat PREFIX of the RFDiff output. Clip all index
+        # lists to the predicted part so the stats cover what was actually
+        # predicted (instead of raising IndexError downstream).
+        n_pred = len(all_af2_res)
+        n_trb = len(trb_dict["inpaint_seq"])
+        print(
+            f"WARNING: predicted PDB has {n_pred} protein residues but the "
+            f"RFDiff output has {n_trb}: rechain created more chains than "
+            f"chains_to_design covers, so the extra chain(s) are missing from "
+            f"the prediction input. RMSD/plDDT stats cover the predicted part "
+            f"only. To predict the full complex, enable boltz_full_complex (or "
+            f"add the extra chain letters to chains_to_design - and rename "
+            f"any colliding boltz_extras chain ids)."
+        )
+        selected_residues_data = [
+            i for i in selected_residues_data if i < n_pred
+        ]
+        selected_residues_in_fixed_chains = [
+            i for i in selected_residues_in_fixed_chains if i < n_pred
+        ]
+        selected_residues_in_designed_chains = [
+            i for i in selected_residues_in_designed_chains if i < n_pred
+        ]
+    if flat_to_token:
+        # boltz_full_complex mode: the predicted PDB holds the FULL spliced
+        # chains (native + designed residues, plus extra chains), so the
+        # trb design-flat indices do NOT equal its residue indices. Select
+        # the predicted design-region atoms through the design-flat ->
+        # protein-token map saved next to the boltz yaml by
+        # build_boltz_full_complex (protein token == index into
+        # all_af2_res, since protein chains come first in the yaml).
+        fixed_set = set(selected_residues_data)
+        all_flat_positions = sorted(flat_to_token)
 
-    af2_all_fixed_res = [all_af2_res[ind]["CA"] for ind in selected_residues_data]
-    af2_sculpted_res = [
-        ind["CA"] for ind in all_af2_res if ind["CA"] not in af2_all_fixed_res
-    ]
-    af2_fixed_chain_res = [
-        all_af2_res[ind]["CA"] for ind in selected_residues_in_fixed_chains
-    ]
-    af2_motif_res = [
-        all_af2_res[ind]["CA"] for ind in selected_residues_in_designed_chains
-    ]
+        def _token_ca(f):
+            return all_af2_res[flat_to_token[f]]["CA"]
+
+        all_af2_res_ca = [_token_ca(f) for f in all_flat_positions]
+        af2_all_fixed_res = [
+            _token_ca(f) for f in selected_residues_data if f in flat_to_token
+        ]
+        af2_sculpted_res = [
+            _token_ca(f)
+            for f in all_flat_positions
+            if f not in fixed_set and f in flat_to_token
+        ]
+        af2_fixed_chain_res = [
+            _token_ca(f)
+            for f in selected_residues_in_fixed_chains
+            if f in flat_to_token
+        ]
+        af2_motif_res = [
+            _token_ca(f)
+            for f in selected_residues_in_designed_chains
+            if f in flat_to_token
+        ]
+    else:
+        all_af2_res_ca = [ind["CA"] for ind in all_af2_res]
+
+        af2_all_fixed_res = [all_af2_res[ind]["CA"] for ind in selected_residues_data]
+        af2_sculpted_res = [
+            ind["CA"] for ind in all_af2_res if ind["CA"] not in af2_all_fixed_res
+        ]
+        af2_fixed_chain_res = [
+            all_af2_res[ind]["CA"] for ind in selected_residues_in_fixed_chains
+        ]
+        af2_motif_res = [
+            all_af2_res[ind]["CA"] for ind in selected_residues_in_designed_chains
+        ]
 
     trb_help = list(trb_dict["inpaint_str"])
     linker_indeces = [
@@ -653,6 +1480,10 @@ def calculate_RMSD_linker_len(
     all_rfdiff_res = list(
         structure_rfdiff.get_residues()
     )  # obtain a list of all the residues in the structure, structure_control is object
+    if not flat_to_token and len(all_rfdiff_res) > len(all_af2_res):
+        # keep the RFDiff side consistent with the clipped predicted part
+        # (see the prefix warning above)
+        all_rfdiff_res = all_rfdiff_res[: len(all_af2_res)]
     all_rfdiff_res_ca = [ind["CA"] for ind in all_rfdiff_res]
 
     rfdiff_all_fixed_res = [
@@ -680,11 +1511,24 @@ def calculate_RMSD_linker_len(
     rfdiff_all_coords = np.array([a.coord for a in all_rfdiff_res_ca])
     af2_all_coords = np.array([a.coord for a in all_af2_res_ca])
 
-    superimposer.set(rfdiff_all_coords, af2_all_coords)
-    superimposer.run()
-    rmsd = get_rmsd_from_coords(
-        rfdiff_all_coords, af2_all_coords, superimposer.rot, superimposer.tran
-    )
+    if len(rfdiff_all_coords) == len(af2_all_coords):
+        superimposer.set(rfdiff_all_coords, af2_all_coords)
+        superimposer.run()
+        rmsd = get_rmsd_from_coords(
+            rfdiff_all_coords,
+            af2_all_coords,
+            superimposer.rot,
+            superimposer.tran,
+        )
+    else:
+        # e.g. boltz_full_complex predictions contain extra native (spliced)
+        # residues, so a whole-structure superimposition is not defined
+        print(
+            f"NOTE: RFDiff and predicted PDB have different numbers of "
+            f"protein residues ({len(rfdiff_all_coords)} vs "
+            f"{len(af2_all_coords)}); 'all' RMSD set to -1."
+        )
+        rmsd = -1
 
     # Align all reference residues if there are no fixed chains. Otherwise, align only fixed chains.  (Very nice because fully fixed chains should be a stable reference)
     # then get rmsd_all_fixed and rmsd_sculpted (If any)
@@ -774,43 +1618,21 @@ def sanitize_string(text):
     return "".join(c for c in text if c in string.printable)
 
 
-def recalculate_a3m(input_a3m_path: str, new_query_seq: str, output_a3m_path: str) -> None:
-    """
-    Recalculates an A3M MSA matrix against a new query sequence.
+# The 20 standard amino acids. Boltz maps every OTHER uppercase letter in an
+# a3m line through prot_letter_to_token (src/boltz/data/const.py): X/J/B/Z/U/O
+# map to the UNK token, anything else (digits, ...) raises a KeyError. To keep
+# the generated files clean and always parsable, homolog lines are normalized
+# to the 20 AAs + gaps only.
+A3M_STD_AA = set("ACDEFGHIKLMNPQRSTVWY")
+# Non-20AA letters that Boltz accepts (as UNK). Kept verbatim in the QUERY
+# line (it must match the chain sequence of the yaml); normalized to gaps in
+# homolog lines.
+A3M_UNK_LETTERS = set("XJBUOZ")
 
-    Args:
-        input_a3m_path: Path to the source A3M file.
-        new_query_seq: The new unaligned query sequence string.
-        output_a3m_path: Path to write the transformed A3M file.
-    """
-    # 1. Parse the original A3M file
-    names = []
-    seqs = []
-    with open(input_a3m_path, 'r') as f:
-        name, seq = "", []
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                if name:
-                    names.append(name)
-                    seqs.append("".join(seq))
-                name = line[1:]
-                seq = []
-            else:
-                seq.append(line)
-        if name:
-            names.append(name)
-            seqs.append("".join(seq))
 
-    if not seqs:
-        raise ValueError("No sequences found in A3M file.")
-
-    # Extract the old query and ensure standard A3M format (no insertions or gaps)
-    old_query_seq = "".join([c for c in seqs[0] if c.isupper()])
-    new_query_clean = new_query_seq.replace('-', '').upper()
-    # 2. Compute global pairwise alignment between old and new queries
+def _a3m_aligner():
+    """Query-vs-query aligner. Input sequences are gapless, so a
+    substitution matrix can be used."""
     aligner = Align.PairwiseAligner()
     aligner.mode = 'global'
     try:
@@ -819,72 +1641,192 @@ def recalculate_a3m(input_a3m_path: str, new_query_seq: str, output_a3m_path: st
     except ImportError:
         aligner.match_score = 2
         aligner.mismatch_score = -1
-
     aligner.open_gap_score = -5
     aligner.extend_gap_score = -1
+    return aligner
 
-    best_aln = aligner.align(new_query_clean, old_query_seq)[0]
+
+def _a3m_row_aligner():
+    """Aligner for projecting one (gap-containing) homolog line onto the
+    query. Uses match/mismatch scores because a substitution matrix rejects
+    gap characters in its inputs."""
+    aligner = Align.PairwiseAligner()
+    aligner.mode = 'global'
+    aligner.match_score = 1
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -4
+    aligner.extend_gap_score = -1
+    return aligner
+
+
+def _parse_a3m_blocks(path):
+    """Parse an a3m file into a list of (header, sequence) blocks.
+
+    Supports both common formats:
+      - standard a3m: one '>' header per sequence; a sequence may be wrapped
+        over several lines (the lines are joined);
+      - single-header a3m: ONE '>' line followed by one independent sequence
+        per line (line 1 = query, the rest = homologs). Those lines must NOT
+        be joined - joining would merge all homologs into one sequence.
+
+    NUL bytes and other non-printable characters are stripped (a stray NUL
+    would crash Boltz's a3m token map).
+    """
+    raw_lines = []
+    with open(path, 'r', errors='replace') as f:
+        for line in f:
+            line = sanitize_string(line.strip())
+            if line:
+                raw_lines.append(line)
+
+    n_hdr = sum(1 for l in raw_lines if l.startswith('>'))
+    seq_lines = [l for l in raw_lines if not l.startswith('>')]
+
+    if n_hdr == 1 and len(seq_lines) >= 2:
+        total = sum(len(l) for l in seq_lines)
+        # Heuristic: wrapped lines of ONE sequence contain a dominant line
+        # (>= half of all sequence characters); independent MSA lines do not.
+        if max(len(l) for l in seq_lines) * 2 < total:
+            header = raw_lines[0]
+            return [(header, s) for s in seq_lines]
+
+    # standard a3m (also covers the single-header/single-sequence case)
+    blocks = []
+    header, seq = None, []
+    for line in raw_lines:
+        if line.startswith('>'):
+            if header is not None:
+                blocks.append((header, "".join(seq)))
+            header, seq = line, []
+        else:
+            seq.append(line)
+    if header is not None:
+        blocks.append((header, "".join(seq)))
+    return blocks
+
+
+def _a3m_guide(line):
+    """Guide (match-state) characters of an a3m line, normalized for Boltz:
+    uppercase 20 AAs kept, gaps kept, every other uppercase letter
+    (X/J/B/Z/U/O/digits/...) -> gap, lowercase insertion characters dropped
+    (they are not aligned to any query position)."""
+    out = []
+    for c in sanitize_string(line):
+        if c == '-':
+            out.append('-')
+        elif c.isupper():
+            out.append(c if c in A3M_STD_AA else '-')
+        # lowercase = insertion relative to the query: dropped
+    return "".join(out)
+
+
+def project_a3m_row_to_query(row, old_query):
+    """Project one homolog a3m line onto the old query columns.
+
+    Returns a gap-normalized guide string of EXACTLY len(old_query) characters:
+    position i corresponds to old_query[i]. Well-aligned rows (same number of
+    guide columns as the query) pass through the character-normalization only;
+    ragged rows (different guide-column count - some a3m files contain them)
+    are re-aligned against the query first, so the column mapping stays sane.
+    """
+    guide = _a3m_guide(row)
+    if len(guide) == len(old_query):
+        return guide
+    if not guide or not old_query:
+        return '-' * len(old_query)
+    aln = _a3m_row_aligner().align(guide, old_query)[0]
+    g_str, q_str = str(aln[0]), str(aln[1])
+    return "".join(
+        g if (g != '-' and q != '-') else '-' for g, q in zip(g_str, q_str) if q != '-'
+    )
+
+
+def recalculate_a3m(input_a3m_path: str, new_query_seq: str, output_a3m_path: str) -> None:
+    """
+    Recalculates an A3M MSA matrix against a new query sequence.
+
+    The output file is guaranteed to be:
+      - rectangular: the query line and EVERY homolog line are exactly
+        len(query) characters wide (lowercase insertion states are dropped,
+        so the width equals the number of query positions);
+      - Boltz-safe: the query line equals the (gapless, uppercase) new query
+        so it matches the chain sequence of the generated boltz.yaml, and
+        every homolog line contains only the 20 standard AAs and gaps (X and
+        other non-standard letters are normalized to gaps; NUL bytes and
+        other non-printables are stripped).
+
+    Accepts both standard a3m (one '>' header per sequence) and
+    single-header a3m (one '>' line, one sequence per line) input files.
+
+    Args:
+        input_a3m_path: Path to the source A3M file.
+        new_query_seq: The new unaligned query sequence string.
+        output_a3m_path: Path to write the transformed A3M file.
+    """
+    blocks = _parse_a3m_blocks(input_a3m_path)
+    if not blocks:
+        raise ValueError(f"No sequences found in A3M file: {input_a3m_path}")
+
+    old_query_seq = _a3m_guide(blocks[0][1]).replace('-', '')
+    new_query_clean = sanitize_string(new_query_seq).replace('-', '').upper()
+
+    if not new_query_clean:
+        raise ValueError("recalculate_a3m: empty new query sequence")
+    bad_query = sorted(set(new_query_clean) - A3M_STD_AA)
+    if bad_query:
+        print(
+            f"WARNING: recalculate_a3m: new query contains non-standard "
+            f"residue(s) {bad_query}; they are kept in the query line (it "
+            f"must match the chain sequence of the yaml). Boltz maps "
+            f"{'/'.join(sorted(A3M_UNK_LETTERS & set(bad_query))) or 'these'} "
+            f"to the UNK token - check the source structure/MPNN output."
+        )
+    if not old_query_seq:
+        raise ValueError(f"recalculate_a3m: input a3m query has no residues: {input_a3m_path}")
+
+    # Global pairwise alignment between the new and the old query
+    try:
+        best_aln = _a3m_aligner().align(new_query_clean, old_query_seq)[0]
+    except ValueError:
+        # new query carries a letter that is not in the BLOSUM62 alphabet
+        # (e.g. X): fall back to the score-based aligner
+        best_aln = _a3m_row_aligner().align(new_query_clean, old_query_seq)[0]
     t_str = str(best_aln[0])  # Target: new query path
     q_str = str(best_aln[1])  # Query: old query path
 
-    # 3. Process and map each alignment sequence
+    n_ragged = 0
     with open(output_a3m_path, 'w') as out:
         out.write(f">query\n{new_query_clean}\n")
 
-        for name, seq in zip(names[1:], seqs[1:]):
-            # Deconstruct the sequence into distinct match and insertion states
-            match_states = []
-            insertions = []
-            current_ins = []
+        for name, seq in blocks[1:]:
+            row = project_a3m_row_to_query(seq, old_query_seq)
+            if len(row) != len(old_query_seq):
+                n_ragged += 1
+                row = row[:len(old_query_seq)]  # defensive; keeps the file rectangular
 
-            for char in seq:
-                if char.isupper() or char == '-':
-                    insertions.append("".join(current_ins))
-                    current_ins = []
-                    match_states.append(char)
-                elif char.islower():
-                    current_ins.append(char)
-            insertions.append("".join(current_ins))
-
-            new_match_states = []
-            new_insertions = []
+            # Re-map the old-query columns onto the new-query positions.
+            # - retained column  -> homolog character at the old position
+            # - new-only column  -> gap (the homolog has no residue there)
+            # - old-only column  -> dropped (the position is not in the query)
+            new_row = []
             old_idx = 0
-            current_new_ins = insertions[0] if insertions else ""
-
-            # Re-map positional coordinates based on the alignment path
             for t_char, q_char in zip(t_str, q_str):
                 if t_char != '-' and q_char != '-':
-                    # Alignment match retained
-                    new_insertions.append(current_new_ins)
-                    M = match_states[old_idx] if old_idx < len(match_states) else '-'
-                    new_match_states.append(M)
+                    new_row.append(row[old_idx])
                     old_idx += 1
-                    current_new_ins = insertions[old_idx] if old_idx < len(insertions) else ""
-
-                elif t_char == '-' and q_char != '-':
-                    # Old match state demoted to an insertion state
-                    M = match_states[old_idx] if old_idx < len(match_states) else '-'
-                    if M != '-':
-                        current_new_ins += M.lower()
-                    old_idx += 1
-                    current_new_ins += insertions[old_idx] if old_idx < len(insertions) else ""
-
                 elif t_char != '-' and q_char == '-':
-                    # New query insertion promotes a new match state
-                    new_insertions.append(current_new_ins)
-                    new_match_states.append('-')
-                    current_new_ins = ""
+                    new_row.append('-')
+                else:  # t_char == '-' and q_char != '-': old-only column
+                    old_idx += 1
 
-            new_insertions.append(current_new_ins)
+            out.write(f">{name}\n{''.join(new_row)}\n")
 
-            # Reconstruct the transformed sequence string
-            final_seq_parts = []
-            for i in range(len(new_match_states)):
-                final_seq_parts.append(new_insertions[i])
-                final_seq_parts.append(new_match_states[i])
-            final_seq_parts.append(new_insertions[-1])
-
-            out.write(f">{name}\n{''.join(final_seq_parts)}\n")
+    if n_ragged:
+        print(
+            f"WARNING: recalculate_a3m: {n_ragged} homolog line(s) of "
+            f"{input_a3m_path} had a different number of guide columns than "
+            f"the query; they were re-aligned and truncated (best effort)."
+        )
 
 
 def make_alignment_file_boltz(sequence_id, sequence, alignment_dir, output_dir):
@@ -1427,6 +2369,33 @@ def rename_pdb_create_csv_colabfold(
         )
 
 
+def monomer_prediction_dirs(model_i, model_name):
+    """Candidate directories holding the monomer prediction for one model
+    (symmetry / monomer scoring). The first EXISTING directory is used.
+
+    - Boltz2 flow: the monomer yaml is written into the same yaml_dir as the
+      main yaml, so its prediction lands in the same predictions tree (no
+      'monomers/' prefix).
+    - AF3/ColabFold flow: monomer predictions are written under
+      {model_i}/monomers/...
+    """
+    return [
+        os.path.join(
+            model_i,
+            "boltz_results_yaml_inputs",
+            "predictions",
+            "monomer_" + model_name,
+        ),
+        os.path.join(
+            model_i,
+            "monomers",
+            "boltz_results_yaml_inputs",
+            "predictions",
+            "monomer_" + model_name,
+        ),
+    ]
+
+
 def rename_pdb_create_csv_boltz(
     cfg,
     output_dir,
@@ -1496,12 +2465,49 @@ def rename_pdb_create_csv_boltz(
     )
     rfdiff_pdb_path = os.path.join(rfdiff_out_dir, f"_{trb_num}.pdb")
 
+    # boltz_full_complex mode: the sidecar map (design flat position ->
+    # protein token in the full spliced Boltz chains) is written next to the
+    # boltz yaml by make_boltz_input_yaml. Used to score only the designed
+    # region of the (much longer) full-complex prediction.
+    fc_files = (
+        sorted(
+            glob.glob(os.path.join(model_i, "yaml_inputs", "*.full_complex.json"))
+        )
+        if not skipRfDiff
+        else []
+    )
+
+    def _load_full_complex_map(pred_name):
+        if not fc_files:
+            return None
+        if len(fc_files) == 1:
+            path = fc_files[0]
+        else:  # several sequences per model dir: match by prediction name
+            path = os.path.join(
+                model_i, "yaml_inputs", f"{pred_name}.full_complex.json"
+            )
+            if not os.path.exists(path):
+                path = fc_files[0]
+        with open(path) as f:
+            fc = json.load(f)
+        print(
+            f"boltz_full_complex: scoring the designed region using the "
+            f"full-complex token map from {path}"
+        )
+        return fc
+
     for (
         directory
     ) in individual_directories:  # for each directory in the predictions folder
         dir_path = Path(directory)
 
         model_name = dir_path.parent.name if not dir_path.is_dir() else dir_path.name
+
+        fc = _load_full_complex_map(model_name)
+        flat_to_token = (
+            {int(k): v for k, v in fc["flat_to_token"].items()} if fc else None
+        )
+        fc_new_tokens = fc.get("new_tokens", []) if fc else []
 
         model_pdb_files = glob.glob(os.path.join(directory, "*.pdb"))
 
@@ -1533,13 +2539,28 @@ def rename_pdb_create_csv_boltz(
 
             # print(f"DEBUG:residue_data_af2 {residue_data_af2}")
             try:
-                plddt_sculpted_list = [
-                    plddt_list[i]
-                    for i in range(0, len(plddt_list))
-                    if i not in residue_data_af2
-                ]
+                if flat_to_token and fc_new_tokens:
+                    # boltz_full_complex: plDDT of the NEW (sculpted) design
+                    # tokens only - the native spliced-in residues are not
+                    # part of the design and must not enter this metric.
+                    plddt_sculpted_list = [
+                        plddt_list[i]
+                        for i in fc_new_tokens
+                        if i < len(plddt_list)
+                    ]
+                    plddt_sculpted = (
+                        int(np.mean(plddt_sculpted_list) * 100)
+                        if plddt_sculpted_list
+                        else -1
+                    )
+                else:
+                    plddt_sculpted_list = [
+                        plddt_list[i]
+                        for i in range(0, len(plddt_list))
+                        if i not in residue_data_af2
+                    ]
 
-                plddt_sculpted = int(np.mean(plddt_sculpted_list) * 100)
+                    plddt_sculpted = int(np.mean(plddt_sculpted_list) * 100)
             except NameError:
                 plddt_sculpted = -1
 
@@ -1551,47 +2572,62 @@ def rename_pdb_create_csv_boltz(
                 rfdiff_pdb_path,
                 symmetry,
                 model_monomer,
+                flat_to_token=flat_to_token,
             )
 
             # if we are doing symmetry or monomer modelling we also want to add monomer rmsd to the output
             if symmetry:
-                monomers_dirname = os.path.join(model_i, "monomers")
-                current_monomer_dirname = os.path.join(
-                    monomers_dirname,
-                    "boltz_results_yaml_inputs",
-                    "predictions",
-                    "monomer_" + model_name,
+                monomer_rmsd = None
+                monomer_plddt = None
+                # AF3/ColabFold put monomer predictions under
+                # {model_i}/monomers/...; in the Boltz2 flow the monomer yaml
+                # is written into the same yaml_dir, so its prediction lands
+                # in the same predictions tree (no 'monomers/' prefix). Try
+                # both layouts.
+                monomer_candidates = monomer_prediction_dirs(
+                    model_i, model_name
                 )
-
-                monomer_pdb_file = os.path.join(
-                    current_monomer_dirname,
-                    "monomer_" + os.path.basename(model_pdb_file),
+                current_monomer_dirname = next(
+                    (d for d in monomer_candidates if os.path.isdir(d)),
+                    monomer_candidates[0],
                 )
-                monomer_rmsd = homooligomer_rmsd.align_monomer(
-                    rfdiff_pdb_path, monomer_pdb_file, save_aligned=False
-                )
-                monomer_json_file = glob.glob(
-                    os.path.join(current_monomer_dirname, "*.json")
-                )[0]
-                monomer_pae_file = glob.glob(
-                    os.path.join(current_monomer_dirname, f"pae_monomer_{pdb_stem}.npz")
-                )[0]
-                monomer_pde_file = glob.glob(
-                    os.path.join(current_monomer_dirname, f"pde_monomer_{pdb_stem}.npz")
-                )[0]
-                monomer_plddt_file = glob.glob(
-                    os.path.join(
-                        current_monomer_dirname, f"plddt_monomer_{pdb_stem}.npz"
+                try:
+                    monomer_pdb_file = os.path.join(
+                        current_monomer_dirname,
+                        "monomer_" + os.path.basename(model_pdb_file),
                     )
-                )[0]
-                with open(monomer_json_file, "r") as f:
-                    monomer_params = json.load(f)
-                monomer_plddt_list = np.load(monomer_plddt_file)["plddt"].tolist()
-                monomer_plddt = int(np.mean(monomer_plddt_list) * 100)
-                monomer_pae_list = np.load(monomer_pae_file)["pae"].tolist()
-                monomer_pae = np.mean(monomer_pae_list)
-                monomer_pde_list = np.load(monomer_pde_file)["pde"].tolist()
-                monomer_pde = np.mean(monomer_pde_list)
+                    monomer_rmsd = homooligomer_rmsd.align_monomer(
+                        rfdiff_pdb_path, monomer_pdb_file, save_aligned=False
+                    )
+                    monomer_json_file = glob.glob(
+                        os.path.join(current_monomer_dirname, "*.json")
+                    )[0]
+                    monomer_pae_file = glob.glob(
+                        os.path.join(current_monomer_dirname, f"pae_monomer_{pdb_stem}.npz")
+                    )[0]
+                    monomer_pde_file = glob.glob(
+                        os.path.join(current_monomer_dirname, f"pde_monomer_{pdb_stem}.npz")
+                    )[0]
+                    monomer_plddt_file = glob.glob(
+                        os.path.join(
+                            current_monomer_dirname, f"plddt_monomer_{pdb_stem}.npz"
+                        )
+                    )[0]
+                    with open(monomer_json_file, "r") as f:
+                        monomer_params = json.load(f)
+                    monomer_plddt_list = np.load(monomer_plddt_file)["plddt"].tolist()
+                    monomer_plddt = int(np.mean(monomer_plddt_list) * 100)
+                    monomer_pae_list = np.load(monomer_pae_file)["pae"].tolist()
+                    monomer_pae = np.mean(monomer_pae_list)
+                    monomer_pde_list = np.load(monomer_pde_file)["pde"].tolist()
+                    monomer_pde = np.mean(monomer_pde_list)
+                except Exception as e:
+                    print(
+                        f"WARNING: monomer scoring for {model_name} skipped "
+                        f"(missing monomer prediction files?): {e}"
+                    )
+                    monomer_rmsd = None
+                    monomer_plddt = None
 
             if model_monomer:
                 monomers_dirname = os.path.join(model_i, "monomers")
@@ -1694,7 +2730,7 @@ def rename_pdb_create_csv_boltz(
                 "path_rfdiff": rfdiff_pdb_path,
             }  # MODEL PATH for scoring_rg_... #jsonfilename for traceability
             dictionary.update(params)
-            if symmetry or model_monomer:
+            if (symmetry or model_monomer) and monomer_rmsd is not None:
                 dictionary["monomer_rmsd"] = monomer_rmsd
                 dictionary["monomer_plddt"] = monomer_plddt
 
@@ -1924,10 +2960,7 @@ def rename_pdb_create_csv_AF3(
                 )
             )[0]
             print(
-                f"DEBUG: files in monomer folder {glob.glob(
-                os.path.join(
-                    monomers_dirname, "monomer_" + model_name, "*"
-                ))}"
+                f"DEBUG: files in monomer folder {glob.glob(os.path.join(monomers_dirname, "monomer_" + model_name, "*"))}"
             )
             monomer_confidences_files = glob.glob(
                 os.path.join(

@@ -19,6 +19,7 @@ from Bio.PDB import PDBParser
 
 import importlib.util
 import logging
+import pickle
 import shutil
 from pathlib import Path
 from typing import List
@@ -233,6 +234,29 @@ def rechain_rfdiff_pdbs(cfg):
             f'{cfg.pymol_python_path} {scripts_folder / "rechain.py"} "{pdb}" "{pdb}" --chain_break_cutoff_A {cfg.chain_break_cutoff_A}',
             cfg=cfg,
         )
+
+        # rechain can split a designed contig chain into several physical
+        # chains; if that exceeds chains_to_design, the trailing chain(s) are
+        # silently dropped from the prediction input (the MPNN fasta only
+        # holds the first chains_to_design chains). Warn early, before hours
+        # of prediction are spent on the truncated complex.
+        if cfg.get("chains_to_design", None):
+            parser = PDBParser(PERMISSIVE=1)
+            structure = parser.get_structure("re_chained", pdb)
+            n_chains_actual = len(structure.get_chains())
+            n_chains_covered = len(cfg.chains_to_design.split())
+            if n_chains_actual > n_chains_covered:
+                log.warning(
+                    f"{pdb}: rechain produced {n_chains_actual} chains but "
+                    f"chains_to_design covers only {n_chains_covered} "
+                    f"('{cfg.chains_to_design}'); the extra "
+                    f"{n_chains_actual - n_chains_covered} trailing chain(s) "
+                    f"will be missing from the prediction input and from the "
+                    f"predicted structure. Add their chain letters to "
+                    f"chains_to_design (watch out for id collisions with "
+                    f"boltz_extras) or enable boltz_full_complex to predict "
+                    f"the full complex."
+                )
 
         """
         When using potentials sometimes there were very disordered structures and a lot of chainbreaks
@@ -480,6 +504,68 @@ def run_boltz_yaml_postprocess(cfg, yaml_path, model_id):
     mod.postprocess_yaml(
         yaml_path, OmegaConf.to_container(cfg, resolve=True), model_id
     )
+
+
+def check_boltz_predictions(cfg, model_dir):
+    """Warn when a `boltz predict` run produced no PDBs at all.
+
+    Boltz exits 0 even when every input failed (the dominant cause is GPU
+    out-of-memory: 'ran out of memory, skipping batch' / 'Number of failed
+    examples: N'). Without this check the run continues and only fails much
+    later with a cryptic FileNotFoundError on output.csv in the scoring step.
+    """
+    n_predicted = len(
+        glob.glob(
+            os.path.join(
+                model_dir,
+                "boltz_results_yaml_inputs",
+                "predictions",
+                "*",
+                "*.pdb",
+            )
+        )
+    )
+    if n_predicted == 0:
+        log.warning(
+            f"Boltz produced no PDBs for {model_dir} (all inputs failed - see "
+            "'Number of failed examples' and 'ran out of memory, skipping "
+            "batch' in the output above). Common causes: GPU out-of-memory "
+            "(lower sampling_steps/recycling_steps, drop --use_potentials, or "
+            "use a larger GPU), /dev/shm exhaustion, or the job being killed "
+            "(exit code -9) under host-RAM pressure when many jobs run in "
+            "parallel. Reduce the workload or the number of concurrent jobs "
+            "and re-run."
+        )
+
+
+def build_boltz_full_complex(cfg, rf_model_num, mpnn_seq):
+    """boltz_full_complex: build the full input PDB chains with the designed
+    (RFDiff/MPNN) segments spliced in, for one design (trb) and one MPNN
+    sequence. Boltz then predicts the whole complex (e.g. a full tetramer)
+    while RFDiff/MPNN only ran on the trimmed contig.
+
+    Returns the full-complex dict (chains, residue/flat position maps) or
+    None when the option is off.
+    """
+    if not cfg.get("boltz_full_complex", False):
+        return None
+    if not cfg.get("pdb_path", None):
+        raise ValueError("boltz_full_complex: requires pdb_path to be set")
+    trb_file = os.path.join(cfg.rfdiff_out_dir, f"_{rf_model_num}.trb")
+    with open(trb_file, "rb") as f:
+        trb_data = pickle.load(f)
+    full_complex = prosculpt.build_boltz_full_complex(
+        cfg,
+        trb_data,
+        mpnn_seq.strip(),
+        os.path.join(cfg.rfdiff_out_dir, f"_{rf_model_num}.pdb"),
+    )
+    if full_complex is None:
+        raise ValueError(
+            "boltz_full_complex: could not build the full-complex chains "
+            "(see the WARNING lines above); check contig/pdb_path/trb"
+        )
+    return full_complex
 
 
 error_messages = ["Testing if we can restart the prosculptApp(cfg)"]
@@ -730,7 +816,13 @@ def do_cycling(cfg):
                 for fasta_file in fasta_files:
                     sequences = []
                     for record in SeqIO.parse(fasta_file, "fasta"):
-                        record.seq = record.seq[: record.seq.find("/")]
+                        # ProteinMPNN joins chains with ':' (not '/'); the
+                        # monomer is the FIRST chain. Without a separator
+                        # (single-chain design) keep the whole sequence.
+                        sep_pos = record.seq.find(":")
+                        record.seq = (
+                            record.seq if sep_pos == -1 else record.seq[:sep_pos]
+                        )
                         idd = record.id
                         record.id = "monomer_" + idd
                         descr = record.description
@@ -907,9 +999,23 @@ def do_cycling(cfg):
                                 )  #
                                 print(a3m_filename)
 
+                                full_complex = build_boltz_full_complex(
+                                    cfg, rf_model_num, mpnn_seq
+                                )
+
+                                # in full-complex mode the a3m realignment must
+                                # match the (longer) spliced chains, not the
+                                # bare design chains
                                 prosculpt.make_alignment_file_boltz(
                                     sequence_id,
-                                    mpnn_seq,
+                                    (
+                                        ":".join(
+                                            c["sequence"]
+                                            for c in full_complex["chains"]
+                                        )
+                                        if full_complex
+                                        else mpnn_seq
+                                    ),
                                     cfg.a3m_dir,
                                     alignment_inputs_dir,
                                 )
@@ -920,6 +1026,7 @@ def do_cycling(cfg):
                                     yaml_dir,
                                     alignment_inputs_dir,
                                     ref_to_pos=boltz_ref_to_pos,
+                                    full_complex=full_complex,
                                 )
                                 run_boltz_yaml_postprocess(
                                     cfg, custom_yaml_path, sequence_id
@@ -930,6 +1037,7 @@ def do_cycling(cfg):
                         f"{boltz_preparation_command}boltz predict {yaml_dir}/ --out_dir {model_dir} --output_format pdb {cfg.get('boltz_options', '')} --diffusion_samples {cfg.num_models}",
                         cfg=cfg,
                     )
+                    check_boltz_predictions(cfg, model_dir)
                 elif cfg.prediction_model == "AF3":  # If using Af3
                     print("Generating custom msa files for AF3")
 
@@ -1040,6 +1148,10 @@ def do_cycling(cfg):
                             else:
                                 mpnn_seq = line
 
+                                full_complex = build_boltz_full_complex(
+                                    cfg, rf_model_num, mpnn_seq
+                                )
+
                                 custom_yaml_path = prosculpt.make_boltz_input_yaml(
                                     cfg,
                                     sequence_id,
@@ -1047,6 +1159,7 @@ def do_cycling(cfg):
                                     yaml_dir,
                                     None,
                                     ref_to_pos=boltz_ref_to_pos,
+                                    full_complex=full_complex,
                                 )
                                 run_boltz_yaml_postprocess(
                                     cfg, custom_yaml_path, sequence_id
@@ -1057,6 +1170,7 @@ def do_cycling(cfg):
                         f"{boltz_preparation_command}boltz predict {yaml_dir}/ --out_dir {model_dir} --output_format pdb {cfg.get('boltz_options', '')} --diffusion_samples {cfg.num_models}",
                         cfg=cfg,
                     )
+                    check_boltz_predictions(cfg, model_dir)
                 elif cfg.prediction_model == "AF3":  # If using Af3
                     json_dir = os.path.join(model_dir, "json_inputs")
                     os.makedirs(json_dir, exist_ok=True)
@@ -1204,6 +1318,21 @@ def final_operations(cfg):
     csv_path = os.path.join(
         cfg.output_dir, "output.csv"
     )  # constructed path 'output.csv defined in rename_pdb_create_csv function
+    if not os.path.exists(csv_path):
+        # rename_pdb_create_csv_* only writes output.csv if it found at
+        # least one predicted PDB. Fail here with an actionable message
+        # instead of a FileNotFoundError deep inside scoring_script.py.
+        raise RuntimeError(
+            f"{csv_path} was not created: no predicted PDBs were found under "
+            f"{cfg.af2_out_dir}, so the prediction step produced no "
+            f"structures. Check the prediction log for 'Number of failed "
+            f"examples' and 'ran out of memory, skipping batch' (GPU OOM) or "
+            f"an exit code -9 (job killed, e.g. host-RAM or /dev/shm "
+            f"pressure from too many concurrent jobs). Reduce "
+            f"sampling_steps/recycling_steps or --use_potentials, or lower "
+            f"the number of concurrent jobs / raise the memory request, "
+            f"then re-run."
+        )
     run_and_log(
         f'{cfg.prosculpt_python_path} {scripts_folder / "scoring_script.py"} {csv_path}',
         cfg=cfg,
